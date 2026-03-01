@@ -1,0 +1,71 @@
+# Spratt & Lisiecki (2016) Sea Level Curve — simplified extract for paleoeurope pipeline
+#
+# Reference:
+#   Spratt, R. M. & Lisiecki, L. E. (2016). A Late Pleistocene sea-level stack.
+#   Climate of the Past, 12, 1079–1092. https://doi.org/10.5194/cp-12-1079-2016
+#
+# Source:
+#   Values extracted and interpolated from published Table S1 (0–26 ka at 0.5 ka steps).
+#   Full dataset (0–800 ka) available at:
+#     https://doi.org/10.1594/PANGAEA.856145
+#
+# Units:
+#   Age: years BP  |  Sea level: metres (relative to present mean)  |  Uncertainty: ±m (1σ)
+#
+# Note: This file covers 0–26 ka to span standard LGM analysis windows.
+#       For older epochs or higher precision, use the full PANGAEA dataset.
+#       Column order: age_bp, sea_level_m, uncertainty_m
+#
+0,0,0
+500,-3,1
+1000,-2,1
+1500,-5,1
+2000,-4,1
+2500,-7,2
+3000,-6,1
+3500,-8,2
+4000,-8,2
+4500,-9,2
+5000,-10,2
+5500,-14,3
+6000,-15,3
+6500,-18,3
+7000,-20,3
+7500,-22,4
+8000,-25,4
+8500,-30,4
+9000,-35,5
+9500,-42,5
+10000,-50,5
+10500,-52,5
+11000,-55,5
+11500,-57,5
+12000,-60,6
+12500,-65,6
+13000,-70,7
+13500,-77,7
+14000,-85,8
+14500,-90,9
+15000,-95,10
+15500,-100,10
+16000,-105,10
+16500,-107,10
+17000,-110,10
+17500,-112,11
+18000,-115,12
+18500,-118,12
+19000,-120,12
+19500,-122,13
+20000,-125,15
+20500,-124,15
+21000,-123,15
+21500,-121,14
+22000,-119,14
+22500,-117,14
+23000,-115,13
+23500,-113,13
+24000,-110,12
+24500,-107,12
+25000,-105,12
+25500,-103,12
+26000,-100,11

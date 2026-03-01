@@ -1,0 +1,49 @@
+name: Notebook Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  notebook:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system GDAL
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y gdal-bin libgdal-dev
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install GDAL==$(gdal-config --version) rasterio rioxarray
+          pip install -e ".[dev,viz]"
+
+      - name: Install Jupyter and Python kernel
+        run: |
+          pip install notebook ipykernel
+          python -m ipykernel install --user --name=python3
+
+      - name: Generate synthetic test data
+        run: python scripts/generate_synthetic_data.py
+
+      - name: Execute fusion demo notebook
+        run: |
+          jupyter nbconvert \
+            --to notebook \
+            --execute \
+            --ExecutePreprocessor.timeout=120 \
+            --output /tmp/01_fusion_demo_executed.ipynb \
+            notebooks/demo_pipeline.ipynb
+        continue-on-error: false

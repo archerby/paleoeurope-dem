@@ -1,0 +1,52 @@
+name: Tests
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system GDAL
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y gdal-bin libgdal-dev
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install GDAL==$(gdal-config --version) rasterio rioxarray
+          pip install -e ".[dev,viz]"
+
+      - name: Generate synthetic test data
+        run: python scripts/generate_synthetic_data.py
+
+      - name: Run unit tests (excluding integration)
+        run: |
+          pytest tests/ -v \
+            --ignore=tests/test_integration.py \
+            --cov=paleoeurope \
+            --cov-report=term-missing \
+            --cov-report=xml
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage.xml
+        continue-on-error: true

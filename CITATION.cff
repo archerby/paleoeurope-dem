@@ -1,0 +1,32 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "PaleoEurope DEM: A Reproducible Pipeline for European Paleo-DEM Reconstruction"
+abstract: >
+  An open-source Python pipeline for generating multi-epoch paleo-digital
+  elevation models (paleo-DEMs) of Europe from the Last Glacial Maximum (21 ka)
+  to the present. Combines FABDEM, GEBCO, ICE-6G_C, and ICE-7G_NA datasets
+  with EGM2008 geoid correction and GIA delta-method deformation.
+version: "1.0.0"
+date-released: "2026-02-26"
+license: MIT
+repository-code: "https://github.com/archerby/paleoeurope-dem"
+url: "https://archerby.github.io/paleoeurope-dem"
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.18804506
+    description: "The Zenodo archive of the processed data."
+keywords:
+  - paleogeography
+  - digital elevation model
+  - glacial isostatic adjustment
+  - FABDEM
+  - GEBCO
+  - ICE-6G
+  - Europe
+  - paleoclimate
+authors:
+  - name: "Pavel Novikau"
+references:
+  - type: article
+    title: "https://doi.org/10.31223/X59T9W"

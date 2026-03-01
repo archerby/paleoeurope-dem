@@ -1,0 +1,32 @@
+name: Lint
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+jobs:
+  ruff:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install ruff
+        run: pip install ruff==0.4.7
+
+      - name: Lint paleoeurope package
+        run: ruff check paleoeurope/
+
+      - name: Lint scripts
+        run: ruff check scripts/
+
+      - name: Lint tests
+        run: ruff check tests/
