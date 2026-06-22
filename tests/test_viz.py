@@ -47,7 +47,10 @@ from paleoeurope.viz.paleocostline_render import (
 def _write_spratt_csv(path: Path, rows: list[tuple[int, float, float]]) -> None:
     """Write a minimal Spratt-format CSV (age_bp, sea_level_m, uncertainty_m)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as fh:
+    # encoding=utf-8 is explicit so the fixture matches the production CSV's
+    # encoding on Windows (where open() would otherwise default to cp1252 and
+    # write a 0x97 byte for the em-dash that pandas then fails to decode).
+    with open(path, "w", encoding="utf-8") as fh:
         fh.write("# Spratt & Lisiecki (2016) — test fixture\n")
         for age_bp, sl, unc in rows:
             fh.write(f"{age_bp},{sl},{unc}\n")
@@ -416,3 +419,109 @@ class TestRenderPaleocostlineEpoch:
             preloaded_coast_gdf=preloaded,
         )
         assert png.exists()
+
+
+# ---------------------------------------------------------------------------
+# Per-basin sea-level override  (sea_level_override_m)
+# ---------------------------------------------------------------------------
+
+
+class TestSeaLevelOverride:
+    """The keyword-only ``sea_level_override_m`` must replace the global Spratt
+    value for the coastline-step selection while leaving the default path
+    (override=None) byte-for-byte identical to today's behaviour.
+
+    Scientific motivation: inside a sill-dammed basin (the Black Sea was an
+    isolated lake until ~9 ka) the global eustatic curve is the WRONG sea level
+    — the basin must be driven by its own cited level curve.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path: Path):
+        self.tmp = tmp_path
+
+        # Spratt CSV: 21 ka → -125 m.  We then override with -40 m so the
+        # selected coastline step is unambiguously different.
+        self.csv = tmp_path / "spratt.csv"
+        rows = [(ka * 1000, float(-ka * 6), 2.0) for ka in range(0, 27)]
+        _write_spratt_csv(self.csv, rows)  # 21 ka → -126 m
+
+        rng = np.random.default_rng(7)
+        data = rng.uniform(-30.0, 300.0, (32, 32)).astype("float32")
+        self.tile = tmp_path / "N62E006_fusion.tif"
+        _write_geotiff(self.tile, data)
+
+        # Coastline steps far apart so nearest-step picks are unambiguous.
+        shp = tmp_path / "coast" / "Paleocoastlines.shp"
+        shp.parent.mkdir(parents=True, exist_ok=True)
+        _make_coast_gdf([-120, -80, -40, 0]).to_file(shp)
+        self.shp = shp
+
+        self.outdir = tmp_path / "out"
+        self.cfg = RenderConfig(max_px=32, dpi=30, fig_size_in=3.0)
+
+    def test_override_selects_step_nearest_override_not_spratt(self):
+        """Unit-level: the engine must feed the OVERRIDE (not the Spratt value)
+        into filter_paleocostlines_for_epoch.
+
+        Spratt(21 ka) = -126 m  → nearest step -120.
+        override      = -40 m   → nearest step  -40.
+        These differ, proving the override is what drives selection.
+        """
+        gdf = _make_coast_gdf([-120, -80, -40, 0])
+
+        spratt_sl = get_sea_level_for_epoch(21.0, self.csv)
+        _, step_default = filter_paleocostlines_for_epoch(gdf, spratt_sl)
+        _, step_override = filter_paleocostlines_for_epoch(gdf, -40.0)
+
+        assert step_default == -120
+        assert step_override == -40
+        assert step_default != step_override
+
+    def test_render_with_override_differs_from_default(self):
+        """End-to-end: a render WITH override=-40 must encode a different
+        coastline step than the default (Spratt) render — visible in the PNG
+        bytes — while both still produce a valid file.
+        """
+        png_default = render_paleocostline_epoch(
+            epoch_ka=21.0,
+            tile_paths={str(self.tile): str(self.tile)},
+            sea_level_csv=self.csv,
+            paleocoastlines_shp=self.shp,
+            output_dir=self.outdir / "default",
+            config=self.cfg,
+        )
+        png_override = render_paleocostline_epoch(
+            epoch_ka=21.0,
+            tile_paths={str(self.tile): str(self.tile)},
+            sea_level_csv=self.csv,
+            paleocoastlines_shp=self.shp,
+            output_dir=self.outdir / "override",
+            config=self.cfg,
+            sea_level_override_m=-40.0,
+        )
+        assert png_default.exists()
+        assert png_override.exists()
+        # Different coastline step → different rasterized land mask → different
+        # rendered pixels.
+        assert png_default.read_bytes() != png_override.read_bytes()
+
+    def test_override_none_is_backward_compatible(self):
+        """override=None (default) must select the SAME step as a render that
+        never passed the kwarg — i.e. the global Spratt path is unchanged.
+        """
+        spratt_sl = get_sea_level_for_epoch(21.0, self.csv)
+        gdf = _make_coast_gdf([-120, -80, -40, 0])
+        _, step_spratt = filter_paleocostlines_for_epoch(gdf, spratt_sl)
+
+        png = render_paleocostline_epoch(
+            epoch_ka=21.0,
+            tile_paths={str(self.tile): str(self.tile)},
+            sea_level_csv=self.csv,
+            paleocoastlines_shp=self.shp,
+            output_dir=self.outdir,
+            config=self.cfg,
+            sea_level_override_m=None,
+        )
+        assert png.exists()
+        assert step_spratt == -120  # unchanged default selection

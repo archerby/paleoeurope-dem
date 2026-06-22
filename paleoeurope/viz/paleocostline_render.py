@@ -453,6 +453,7 @@ def render_paleocostline_epoch(
     *,
     data_source_label: str = "fusion",
     preloaded_coast_gdf: Optional[gpd.GeoDataFrame] = None,
+    sea_level_override_m: Optional[float] = None,
 ) -> Path:
     """Render a composite paleo-topography image for one epoch.
 
@@ -481,6 +482,19 @@ def render_paleocostline_epoch(
         Pre-loaded Paleocoastlines GeoDataFrame (from a previous call to
         :func:`load_paleocostlines`).  If ``None`` the shapefile is loaded
         inside this call.
+    sea_level_override_m : float | None
+        Per-basin sea-level override in metres vs present global sea level
+        (negative = below today).  When ``None`` (default) the global
+        Spratt & Lisiecki (2016) value is used — identical, backward-compatible
+        behaviour.  When given, this value (NOT the Spratt value) selects the
+        coastline step via :func:`filter_paleocostlines_for_epoch`, and the
+        override is recorded in the figure title / ``mask_src`` label so the
+        frame is self-documenting.
+
+        This exists because a sill-dammed basin (e.g. the Black Sea, an
+        isolated lake until ~9 ka) must NOT inherit the global eustatic curve
+        inside the decoupled basin — it has its own cited level curve.  Pass
+        that basin's level for *epoch_ka* here.
 
     Returns
     -------
@@ -497,14 +511,26 @@ def render_paleocostline_epoch(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Sea level & coastline ────────────────────────────────────────────────
+    # The global Spratt & Lisiecki value is always computed (it is the default
+    # and remains the basis for the global-ocean datum).  A per-basin override,
+    # when supplied, REPLACES it for the coastline-step selection only — this is
+    # how a sill-dammed basin (e.g. the Black Sea, isolated until ~9 ka) is
+    # driven by its own cited level curve instead of the global eustatic curve.
     spratt_sl = get_sea_level_for_epoch(epoch_ka, sea_level_csv)
+
+    if sea_level_override_m is not None:
+        selection_sl = float(sea_level_override_m)
+        sl_source_label = f"basin-override {selection_sl:+.0f} m"
+    else:
+        selection_sl = spratt_sl
+        sl_source_label = None  # default: label derived from the matched step
 
     coast_gdf = (
         preloaded_coast_gdf
         if preloaded_coast_gdf is not None
         else load_paleocostlines(paleocoastlines_shp)
     )
-    land_gdf, coast_level = filter_paleocostlines_for_epoch(coast_gdf, spratt_sl)
+    land_gdf, coast_level = filter_paleocostlines_for_epoch(coast_gdf, selection_sl)
 
     # ── DEM mosaic ───────────────────────────────────────────────────────────
     dem, ice, xform, bounds, crs, _res = build_epoch_mosaic(tile_paths, cfg)
@@ -550,12 +576,16 @@ def render_paleocostline_epoch(
         land_mask = (~nodata) & vector_land
         ocean_mask = (~nodata) & (~vector_land)
         mask_src = f"Paleocoastlines {coast_level:+d} m"
+        if sl_source_label is not None:
+            mask_src += f" [{sl_source_label}]"
     else:
         ocean_raw = (~nodata) & (dem_sm < 0.0)
         ocean_mask = binary_closing(ocean_raw, iterations=2) & (~nodata)
         ocean_mask = binary_opening(ocean_mask, iterations=2).astype(bool)
         land_mask = (~nodata) & (~ocean_mask)
         mask_src = "DEM threshold 0 m (vector unavailable)"
+        if sl_source_label is not None:
+            mask_src += f" [{sl_source_label}]"
 
     # Hillshade
     cos_lat = np.cos(np.radians((bounds.bottom + bounds.top) / 2.0))
