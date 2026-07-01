@@ -109,6 +109,9 @@ class RenderConfig:
     land_elev_percentile_lo: float = 2.0
     land_elev_percentile_hi: float = 98.0
     extra_figure_title: str = ""
+    ice_model_label: str = "ICE-7G"
+    """Name of the GIA/ice model shown in the figure title. The Black Sea bake
+    is ICE-6G_C, so it passes 'ICE-6G_C' to keep the annotation truthful."""
     ice_dome_sigma_px: float = 60.0
     """Gaussian σ (pixels) applied to the DEM *before* hillshade on ice-covered
     pixels.  Removes bedrock texture under the glacier so the dome surface
@@ -489,6 +492,7 @@ def render_paleocostline_epoch(
     data_source_label: str = "fusion",
     preloaded_coast_gdf: Optional[gpd.GeoDataFrame] = None,
     sea_level_override_m: Optional[float] = None,
+    force_dem_mask: bool = False,
 ) -> Path:
     """Render a composite paleo-topography image for one epoch.
 
@@ -530,6 +534,12 @@ def render_paleocostline_epoch(
         isolated lake until ~9 ka) must NOT inherit the global eustatic curve
         inside the decoupled basin — it has its own cited level curve.  Pass
         that basin's level for *epoch_ka* here.
+    force_dem_mask : bool
+        When True, skip the vector Paleocoastlines and derive land/sea directly
+        from the paleo-DEM against ``selection_sl`` (``dem < selection_sl``).  For a
+        decoupled basin this makes the shoreline follow the cited level continuously
+        instead of snapping to the coarse global-eustatic vector steps (which barely
+        move across a -30 to -115 m sweep and mix in the wrong open-ocean basin).
 
     Returns
     -------
@@ -604,8 +614,11 @@ def render_paleocostline_epoch(
         dem_fs = np.where(ice_mask, dem_dome_blend, dem_fs)
         del dem_ice_input, dem_ice_dome, dem_dome_blend, ice_h_norm
 
-    # Land / sea mask — vector first, DEM fallback
-    vector_land = rasterize_land_mask(land_gdf, xform, H, W, crs, bounds)
+    # Land / sea mask. force_dem_mask -> DEM-driven at selection_sl (basin path);
+    # otherwise vector first, DEM fallback (also at selection_sl, not a hard 0 m).
+    vector_land = None if force_dem_mask else rasterize_land_mask(
+        land_gdf, xform, H, W, crs, bounds
+    )
 
     if vector_land is not None:
         land_mask = (~nodata) & vector_land
@@ -614,11 +627,13 @@ def render_paleocostline_epoch(
         if sl_source_label is not None:
             mask_src += f" [{sl_source_label}]"
     else:
-        ocean_raw = (~nodata) & (dem_sm < 0.0)
-        ocean_mask = binary_closing(ocean_raw, iterations=2) & (~nodata)
-        ocean_mask = binary_opening(ocean_mask, iterations=2).astype(bool)
+        ocean_mask = dem_threshold_ocean(dem_sm, nodata, selection_sl)
         land_mask = (~nodata) & (~ocean_mask)
-        mask_src = "DEM threshold 0 m (vector unavailable)"
+        mask_src = (
+            f"DEM contour {selection_sl:+.0f} m"
+            if force_dem_mask
+            else f"DEM threshold {selection_sl:+.0f} m (vector unavailable)"
+        )
         if sl_source_label is not None:
             mask_src += f" [{sl_source_label}]"
 
@@ -646,8 +661,9 @@ def render_paleocostline_epoch(
     l_base = plt.cm.terrain(l_norm * 0.57 + 0.25)[..., :3]
     land_rgb = np.clip(l_base * (hs3 * 0.72 + 0.28), 0.0, 1.0)
 
-    # Ocean colour — sqrt-stretched depth
-    depth = np.where(ocean_mask, np.clip(-dem_f, 0.0, None), 0.0)
+    # Ocean colour — sqrt-stretched depth BELOW THE EPOCH SURFACE (selection_sl),
+    # so a lowered decoupled basin reads as shallower, not as deep as today.
+    depth = ocean_depth_from_surface(dem_f, ocean_mask, selection_sl)
     if ocean_mask.any():
         max_depth = max(float(np.percentile(depth[ocean_mask], 95)), 1.0)
     else:
@@ -700,7 +716,12 @@ def render_paleocostline_epoch(
         )
         sm.set_array([])
         cb = fig.colorbar(sm, ax=ax, fraction=0.025, pad=0.02, shrink=0.5)
-        cb.set_label("Depth below sea level (m)", fontsize=11)
+        depth_label = (
+            "Depth below basin surface (m)"
+            if sea_level_override_m is not None
+            else "Depth below sea level (m)"
+        )
+        cb.set_label(depth_label, fontsize=11)
 
     n_valid = max(int((~nodata).sum()), 1)
     pct_land = land_mask.sum() / n_valid * 100
@@ -708,7 +729,9 @@ def render_paleocostline_epoch(
     pct_ice = ice_mask.sum() / n_valid * 100
 
     legend_items = [
-        Line2D([0], [0], color="#2a6db5", lw=6, label=f"Ocean  ({mask_src})"),
+        Line2D([0], [0], color="#2a6db5", lw=6,
+               label=(f"{'Lake' if sea_level_override_m is not None else 'Ocean'}"
+                      f"  ({mask_src})")),
         Line2D([0], [0], color="#6b8f3a", lw=6, label="Land  (hillshade + terrain)"),
     ]
     if ice_mask.any():
@@ -729,7 +752,7 @@ def render_paleocostline_epoch(
 
     title_lines = [
         f"Paleo Render  –  {epoch_ka} ka BP  [{data_source_label.upper()}]",
-        f"Coastline: {mask_src}  |  GIA + ICE-7G corrected DEM",
+        f"Coastline: {mask_src}  |  GIA + {cfg.ice_model_label} corrected DEM",
         (
             f"land={pct_land:.0f}%  sea={pct_sea:.0f}%  ice={pct_ice:.0f}%  |  "
             f"{bounds.left:.1f}–{bounds.right:.1f}°E  "
