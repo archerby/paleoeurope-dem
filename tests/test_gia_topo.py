@@ -50,8 +50,6 @@ def test_offset_ignores_nan_deep_cell():
     assert implied_sea_surface_offset(topo_t, topo_0) == pytest.approx(112.0)
 
 
-# append to tests/test_gia_topo.py
-import os
 from pathlib import Path
 import xarray as xr
 
