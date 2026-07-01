@@ -54,9 +54,11 @@ if str(_REPO_ROOT) not in sys.path:
 
 import matplotlib
 
+# Force the headless Agg backend BEFORE importing paleocostline_render — that
+# module renders via matplotlib.pyplot and does not set a backend itself, so this
+# guard is required for the render calls to work in a headless/background context.
 matplotlib.use("Agg")
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import rasterio
