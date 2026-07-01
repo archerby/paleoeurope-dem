@@ -541,3 +541,18 @@ def test_ocean_depth_is_measured_below_the_epoch_surface():
     assert depth[0, 1] == pytest.approx(0.0)
     # Non-ocean pixel -> 0.
     assert depth[0, 2] == pytest.approx(0.0)
+
+
+from paleoeurope.viz.paleocostline_render import dem_threshold_ocean
+
+
+def test_dem_threshold_ocean_uses_the_water_level_not_zero():
+    dem = np.full((20, 20), -40.0)   # everywhere at -40 m
+    nodata = np.zeros((20, 20), dtype=bool)
+    # At level 0 m: -40 < 0 -> ocean. Check the INTERIOR (binary_closing/opening
+    # with iterations=2 erodes a ~3-px border on an all-True field via the default
+    # border_value=0 — that de-speckle border behavior is inherited from the code
+    # this helper extracts and is harmless for an interior basin on a large frame).
+    assert dem_threshold_ocean(dem, nodata, 0.0)[4:-4, 4:-4].all()
+    # At level -80 m (basin lowstand): -40 is NOT below -80 -> no ocean anywhere.
+    assert not dem_threshold_ocean(dem, nodata, -80.0).any()

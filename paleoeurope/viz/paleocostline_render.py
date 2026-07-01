@@ -346,6 +346,24 @@ def ocean_depth_from_surface(
     return np.where(ocean_mask, np.clip(water_level - dem, 0.0, None), 0.0)
 
 
+def dem_threshold_ocean(
+    dem_sm: np.ndarray,
+    nodata: np.ndarray,
+    water_level: float,
+) -> np.ndarray:
+    """Boolean ocean mask from the DEM: submerged where ``dem_sm < water_level``.
+
+    ``water_level`` is the epoch/basin surface (present-datum).  Morphological
+    closing then opening (2 iterations each) removes single-pixel speckle.  This
+    is the basin-correct replacement for the old hard ``dem_sm < 0.0`` fallback,
+    which silently ignored the override.
+    """
+    ocean_raw = (~nodata) & (dem_sm < water_level)
+    ocean = binary_closing(ocean_raw, iterations=2) & (~nodata)
+    ocean = binary_opening(ocean, iterations=2).astype(bool)
+    return ocean
+
+
 def build_epoch_mosaic(
     tile_paths: dict[str, str | Path],
     config: Optional[RenderConfig] = None,
