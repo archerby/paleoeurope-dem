@@ -33,9 +33,9 @@ ice_height = 0 everywhere (no ice sheet over the Black Sea).
 
 OUTPUT
 ------
-  D:/pasha/RESEARCH/renders/black_sea_corrected/topo/correct/*.png
+  D:/pasha/RESEARCH/renders/black_sea_corrected/topo/correct/{gradual,catastrophic}/*.png
   D:/pasha/RESEARCH/renders/black_sea_corrected/topo/wrong/*.png
-  D:/pasha/RESEARCH/renders/black_sea_corrected/topo/black_sea_topo_comparison.png
+  (QC gallery over all three: scripts/make_bs_qc_gallery.py -> topo/bs_qc_gallery.html)
 
 Run (repo NOT pip-installed):
     PYTHONPATH=/d/pasha/RESEARCH/renders/paleoeurope-dem \
@@ -276,7 +276,7 @@ def main() -> None:
                 preloaded_coast_gdf=coast_gdf,
             )
 
-        # WRONG — global eustatic, DEM-driven at the global level (for the montage).
+        # WRONG — global eustatic, DEM-driven at the global level (comparison ref).
         render_paleocostline_epoch(
             epoch,
             {"bs": str(paleo_tif)},
