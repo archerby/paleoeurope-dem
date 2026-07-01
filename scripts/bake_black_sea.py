@@ -56,7 +56,6 @@ import matplotlib
 
 matplotlib.use("Agg")
 
-import matplotlib.image as mpimg
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -98,7 +97,10 @@ PALEOCOASTLINES_SHP = Path(
 OUT_BASE = Path(r"D:/pasha/RESEARCH/renders/black_sea_corrected/topo")
 PALEO_TIF_DIR = _REPO_ROOT / "outputs" / "_bs_paleo"
 
-EPOCHS_KA = [18, 16, 12, 10, 9, 0]
+# On the ICE-6G 0.5-ka grid (only ages with an I6_C.VM5a_10min.<age>.nc file),
+# chosen to sample the cited curve's load-bearing features: 22 LGM min (-120),
+# 16.5 spill (-30), 12/11/10 lowstand middle, 9.5/9 reconnection, Holocene refill.
+EPOCHS_KA = [22, 18, 16.5, 14.5, 12, 11, 10, 9.5, 9, 7.5, 5, 2, 0]
 
 # Reconnection scenarios exposed by the cited curve (carry both, assert neither).
 SCENARIOS = ("gradual", "catastrophic")
@@ -230,55 +232,50 @@ def build_paleo_dem(epoch: float) -> Path:
 def main() -> None:
     pontic_df = pd.read_csv(PONTIC_CSV, comment="#")
 
-    out_correct = OUT_BASE / "correct"
+    cfg = RenderConfig(max_px=2000, ice_model_label="ICE-6G_C")
+
+    # Output dirs: one CORRECT dir per scenario + one WRONG (global) dir.
     out_wrong = OUT_BASE / "wrong"
-    out_correct.mkdir(parents=True, exist_ok=True)
     out_wrong.mkdir(parents=True, exist_ok=True)
+    out_correct = {s: OUT_BASE / "correct" / s for s in SCENARIOS}
+    for d in out_correct.values():
+        d.mkdir(parents=True, exist_ok=True)
 
-    # Load the Paleocoastlines vector ONCE and reuse for every render.
-    print("Loading Paleocoastlines vector (once) ...")
+    # Load the Paleocoastlines vector ONCE and reuse. force_dem_mask ignores the
+    # vector, but passing it as preloaded_coast_gdf avoids re-loading the big
+    # shapefile on every render call. Best-effort: the DEM-driven path does not
+    # need it, so do not abort if it is absent.
     coast_gdf = load_paleocostlines(PALEOCOASTLINES_SHP)
-    if coast_gdf is None:
-        raise SystemExit("FATAL: Paleocoastlines vector failed to load.")
-    avail_levels = sorted(coast_gdf["Sea level"].dropna().unique())
-    print(f"  loaded {len(coast_gdf)} polygons; "
-          f"{len(avail_levels)} sea-level steps "
-          f"[{int(min(avail_levels))}..{int(max(avail_levels))} m]")
-
-    cfg = RenderConfig(max_px=2000)
 
     print()
-    header = (f"{'epoch':>6} | {'global_sl':>10} | {'bs_sl':>8} | "
-              f"{'wrong_coast':>12} | {'correct_coast':>14}")
+    header = f"{'epoch':>6} | {'global_sl':>10} | {'grad':>7} | {'catas':>7}"
     print(header)
     print("-" * len(header))
 
-    rows = []  # for the montage
     for epoch in EPOCHS_KA:
         paleo_tif = build_paleo_dem(epoch)
-
-        bs_sl = pontic_level(pontic_df, epoch)
         global_sl = get_sea_level_for_epoch(epoch, SPRATT_CSV)
 
-        # Nearest Paleocoastlines step each render will actually snap to.
-        wrong_coast = int(min(avail_levels, key=lambda x: abs(x - global_sl)))
-        correct_coast = int(min(avail_levels, key=lambda x: abs(x - bs_sl)))
+        # CORRECT — one frame per scenario, DEM-driven at the basin level.
+        levels = {}
+        for scenario in SCENARIOS:
+            bs_sl = pontic_level(pontic_df, epoch, scenario)
+            levels[scenario] = bs_sl
+            render_paleocostline_epoch(
+                epoch,
+                {"bs": str(paleo_tif)},
+                sea_level_csv=SPRATT_CSV,
+                paleocoastlines_shp=PALEOCOASTLINES_SHP,
+                output_dir=out_correct[scenario],
+                config=cfg,
+                data_source_label=f"Pontic-{scenario}",
+                sea_level_override_m=bs_sl,
+                force_dem_mask=True,
+                preloaded_coast_gdf=coast_gdf,
+            )
 
-        # CORRECT — Pontic basin override.
-        correct_png = render_paleocostline_epoch(
-            epoch,
-            {"bs": str(paleo_tif)},
-            sea_level_csv=SPRATT_CSV,
-            paleocoastlines_shp=PALEOCOASTLINES_SHP,
-            output_dir=out_correct,
-            config=cfg,
-            data_source_label="Pontic",
-            sea_level_override_m=bs_sl,
-            preloaded_coast_gdf=coast_gdf,
-        )
-
-        # WRONG — global eustatic (no override).
-        wrong_png = render_paleocostline_epoch(
+        # WRONG — global eustatic, DEM-driven at the global level (for the montage).
+        render_paleocostline_epoch(
             epoch,
             {"bs": str(paleo_tif)},
             sea_level_csv=SPRATT_CSV,
@@ -287,79 +284,17 @@ def main() -> None:
             config=cfg,
             data_source_label="global-eustatic",
             sea_level_override_m=None,
+            force_dem_mask=True,
             preloaded_coast_gdf=coast_gdf,
         )
 
-        print(f"{epoch:>6} | {global_sl:>+10.2f} | {bs_sl:>+8.2f} | "
-              f"{wrong_coast:>+12d} | {correct_coast:>+14d}")
-
-        rows.append(
-            dict(
-                epoch=epoch,
-                global_sl=global_sl,
-                bs_sl=bs_sl,
-                wrong_coast=wrong_coast,
-                correct_coast=correct_coast,
-                wrong_png=Path(wrong_png),
-                correct_png=Path(correct_png),
-            )
-        )
-
-    # ── Comparison montage ──────────────────────────────────────────────────
-    n = len(rows)
-    fig, axes = plt.subplots(n, 2, figsize=(11, 5.2 * n))
-    if n == 1:
-        axes = axes.reshape(1, 2)
-
-    for i, r in enumerate(rows):
-        wrong_img = mpimg.imread(r["wrong_png"])
-        correct_img = mpimg.imread(r["correct_png"])
-
-        ax_w = axes[i, 0]
-        ax_c = axes[i, 1]
-        ax_w.imshow(wrong_img)
-        ax_c.imshow(correct_img)
-        for ax in (ax_w, ax_c):
-            ax.set_xticks([])
-            ax.set_yticks([])
-
-        if i == 0:
-            ax_w.set_title("WRONG — global eustatic", fontsize=13, color="#a11")
-            ax_c.set_title("CORRECT — Pontic basin", fontsize=13, color="#161")
-
-        ax_w.set_ylabel(
-            f"{r['epoch']} ka\n"
-            f"global {r['global_sl']:+.0f} m\n"
-            f"(coast {r['wrong_coast']:+d} m)",
-            fontsize=10, rotation=0, labelpad=46, va="center",
-        )
-        # Right-side annotation for the corrected level.
-        ax_c.text(
-            1.02, 0.5,
-            f"Pontic {r['bs_sl']:+.0f} m\n(coast {r['correct_coast']:+d} m)",
-            transform=ax_c.transAxes, fontsize=10, va="center", ha="left",
-            color="#161",
-        )
-
-    fig.suptitle(
-        "Black Sea paleo-topography: scientific correction of the decoupled "
-        "basin level\n"
-        "Left = WRONG global eustatic (Spratt & Lisiecki 2016) applied inside "
-        "the sill-dammed lake.\n"
-        "Right = CORRECT cited Pontic / Neoeuxinian basin curve "
-        "(gradual scenario). GMRT DEM + ICE-6G_C GIA.",
-        fontsize=12, y=0.997,
-    )
-    fig.tight_layout(rect=(0.04, 0.0, 0.92, 0.985))
-
-    montage = OUT_BASE / "black_sea_topo_comparison.png"
-    fig.savefig(montage, dpi=130, bbox_inches="tight")
-    plt.close(fig)
+        print(f"{epoch:>6} | {global_sl:>+10.2f} | {levels['gradual']:>+7.1f} | "
+              f"{levels['catastrophic']:>+7.1f}")
 
     print()
-    print(f"Montage written: {montage}")
-    print(f"Correct frames:  {out_correct}")
-    print(f"Wrong frames:    {out_wrong}")
+    print(f"Correct (gradual):      {out_correct['gradual']}")
+    print(f"Correct (catastrophic): {out_correct['catastrophic']}")
+    print(f"Wrong (global):         {out_wrong}")
 
 
 if __name__ == "__main__":
