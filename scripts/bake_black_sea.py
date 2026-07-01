@@ -98,8 +98,8 @@ PALEO_TIF_DIR = _REPO_ROOT / "outputs" / "_bs_paleo"
 
 EPOCHS_KA = [18, 16, 12, 10, 9, 0]
 
-# Pontic curve column (default gradual-reconnection scenario).
-BS_COLUMN = "level_m_global_gradual"
+# Reconnection scenarios exposed by the cited curve (carry both, assert neither).
+SCENARIOS = ("gradual", "catastrophic")
 
 # Region buffer (deg) for the GIA subset around the BS bbox 27-42E / 40-48N.
 LAT_MIN, LAT_MAX = 40.0, 48.0
@@ -123,10 +123,25 @@ def _epoch_filename(epoch: float) -> str:
     return f"I6_C.VM5a_10min.{epoch}.nc"
 
 
-def pontic_level(df: pd.DataFrame, epoch: float) -> float:
-    """Nearest-age Pontic basin level (m vs present global SL) for *epoch*."""
+def pontic_level(df: pd.DataFrame, epoch: float, scenario: str = "gradual") -> float:
+    """Nearest-age Pontic basin level (m vs present global SL) for *epoch*.
+
+    *scenario* selects the reconnection column (``gradual`` or ``catastrophic``).
+    A sign-flip guard asserts the level is at or below present sea level (curve §3):
+    a positive value would put the shoreline above the surrounding terrain.
+    """
+    col = f"level_m_global_{scenario}"
+    if col not in df.columns:
+        raise ValueError(
+            f"unknown scenario {scenario!r}; available columns={list(df.columns)}"
+        )
     idx = (df["age_ka"] - float(epoch)).abs().idxmin()
-    return float(df.loc[idx, BS_COLUMN])
+    level = float(df.loc[idx, col])
+    assert level <= 1.0, (
+        f"basin level {level:+.1f} m > +1 m at {epoch} ka — sign-flip guard "
+        "(curve doc §3)"
+    )
+    return level
 
 
 def gia_delta_subset(epoch: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
