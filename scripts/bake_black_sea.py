@@ -84,9 +84,11 @@ PONTIC_CSV = Path(
     r"D:/pasha/RESEARCH/Paleo-Europe_3D/docs/superpowers/research"
     r"/2026-06-21-black-sea-level-curve.csv"
 )
+# Simplified curve: 0 ka -> 0 m (the full CSV has a +8.49 m present-datum offset
+# and must NOT be used for the global-eustatic reference frames).
 SPRATT_CSV = Path(
     r"D:/pasha/RESEARCH/Paleo-Europe_3D/data/raw/sea_level_curves"
-    r"/spratt_lisiecki_2016_full.csv"
+    r"/spratt_lisiecki_2016_simplified.csv"
 )
 PALEOCOASTLINES_SHP = Path(
     r"D:/pasha/RESEARCH/Paleo-Europe_3D/data/raw/paleocostline"
