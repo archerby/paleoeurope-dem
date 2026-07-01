@@ -24,7 +24,11 @@ single basin level is valid for the entire frame.
 
 PALEO-DEM
 ---------
-paleo_dem(t) = H_modern + Δz_GIA(t),  Δz_GIA(t) = Orog(t) - Orog(0)  (ICE-6G_C)
+paleo_dem(t) = H_modern + Δz_solid(t)   (present-datum solid-earth displacement)
+Δz_solid(t)  = [Topo(t) - Topo(0)] - sea_surface_offset(t)   (ICE-6G_C Topo)
+sea_surface_offset(t) = median over deep ocean of [Topo(t) - Topo(0)]
+    (Orog is clamped to 0 over water -> GIA vanishes under the sea; bare ΔTopo
+     double-counts the epoch sea surface. See paleoeurope.gia.ice6g_topo.)
 ice_height = 0 everywhere (no ice sheet over the Black Sea).
 
 OUTPUT
@@ -60,6 +64,7 @@ import rasterio
 import xarray as xr
 
 from paleoeurope.gia.deformation import apply_gia_delta
+from paleoeurope.gia.ice6g_topo import implied_sea_surface_offset, solid_displacement
 from paleoeurope.viz.paleocostline_render import (
     RenderConfig,
     get_sea_level_for_epoch,
@@ -125,10 +130,11 @@ def pontic_level(df: pd.DataFrame, epoch: float) -> float:
 
 
 def gia_delta_subset(epoch: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return (dz, model_lats, model_lons) for the BS region at *epoch*.
+    """Return (dz_solid, model_lats, model_lons) for the BS region at *epoch*.
 
-    dz = Orog(epoch) - Orog(0), subset to the BS bbox +/- BUF.  lon is in the
-    0-360 convention; the BS bbox (27-42E) maps directly with no wrap.
+    dz_solid = present-datum solid-earth displacement (Topo-based), subset to the
+    BS bbox +/- BUF.  The sea-surface offset is computed from the GLOBAL Topo field
+    (deep-ocean median) so the datum is internally consistent with ICE-6G.
     """
     f_t = ICE6G_DIR / _epoch_filename(epoch)
     f_0 = ICE6G_DIR / _epoch_filename(0)
@@ -136,14 +142,19 @@ def gia_delta_subset(epoch: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     lon_lo, lon_hi = LON_MIN - BUF, LON_MAX + BUF
 
     with xr.open_dataset(f_t) as ds_t, xr.open_dataset(f_0) as ds_0:
+        # Global sea-surface offset (deep-ocean median of ΔTopo).
+        offset = implied_sea_surface_offset(
+            ds_t["Topo"].values.astype(np.float64),
+            ds_0["Topo"].values.astype(np.float64),
+        )
         sub_t = ds_t.sel(lat=slice(lat_lo, lat_hi), lon=slice(lon_lo, lon_hi))
         sub_0 = ds_0.sel(lat=slice(lat_lo, lat_hi), lon=slice(lon_lo, lon_hi))
-        orog_t = sub_t["Orog"].values.astype(np.float64)
-        orog_0 = sub_0["Orog"].values.astype(np.float64)
+        topo_t = sub_t["Topo"].values.astype(np.float64)
+        topo_0 = sub_0["Topo"].values.astype(np.float64)
         model_lats = sub_t["lat"].values.astype(np.float64)
         model_lons = sub_t["lon"].values.astype(np.float64)
 
-    dz = (orog_t - orog_0).astype(np.float32)  # (M, N)
+    dz = solid_displacement(topo_t, topo_0, offset).astype(np.float32)  # (M, N)
     return dz, model_lats, model_lons
 
 
