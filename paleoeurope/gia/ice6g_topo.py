@@ -54,7 +54,9 @@ def implied_sea_surface_offset(
     deep = topo_0 < deep_threshold
     if not np.any(deep):
         raise ValueError("no deep-ocean cells found for the sea-surface offset")
-    return float(np.median(delta[deep]))
+    # nanmedian (not median): ICE-6G_C ``Topo`` declares _FillValue = 1e+20, so a
+    # stray fill/NaN deep-ocean cell is ignored instead of poisoning the offset.
+    return float(np.nanmedian(delta[deep]))
 
 
 def solid_displacement(

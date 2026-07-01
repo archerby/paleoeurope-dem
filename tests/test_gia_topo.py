@@ -31,3 +31,20 @@ def test_solid_displacement_recovers_uplift_over_land():
     dz = solid_displacement(topo_t, topo_0, offset)
     assert dz[0, 2] == pytest.approx(50.0)
     assert np.allclose(dz[0, :2], 0.0, atol=1e-6)
+
+
+def test_offset_raises_when_no_deep_ocean_cells():
+    # All cells are shallow/land (topo_0 >= -1000) → no deep-ocean subset exists,
+    # so there is no far-field basis for the sea-surface offset.
+    topo_0 = np.array([[10.0, 500.0]])
+    topo_t = topo_0 + 5.0
+    with pytest.raises(ValueError):
+        implied_sea_surface_offset(topo_t, topo_0)
+
+
+def test_offset_ignores_nan_deep_cell():
+    # Three deep-ocean cells: two rose by +112, one is NaN (an ICE-6G _FillValue).
+    # nanmedian must ignore the NaN and still recover +112 (plain median would NaN).
+    topo_0 = np.array([[-2000.0, -3000.0, -4000.0]])
+    topo_t = np.array([[-2000.0 + 112.0, -3000.0 + 112.0, np.nan]])
+    assert implied_sea_surface_offset(topo_t, topo_0) == pytest.approx(112.0)
