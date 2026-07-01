@@ -525,3 +525,19 @@ class TestSeaLevelOverride:
         )
         assert png.exists()
         assert step_spratt == -120  # unchanged default selection
+
+
+from paleoeurope.viz.paleocostline_render import ocean_depth_from_surface
+
+
+def test_ocean_depth_is_measured_below_the_epoch_surface():
+    # Sea floor at -2000 m; lake surface (override) at -80 m.
+    dem = np.array([[-2000.0, -50.0, 10.0]])
+    ocean = np.array([[True, True, False]])
+    depth = ocean_depth_from_surface(dem, ocean, water_level=-80.0)
+    # Deep pixel: below the -80 surface: -80 - (-2000) = 1920.
+    assert depth[0, 0] == pytest.approx(1920.0)
+    # Pixel at -50 m is ABOVE the -80 m surface -> not really submerged -> depth 0.
+    assert depth[0, 1] == pytest.approx(0.0)
+    # Non-ocean pixel -> 0.
+    assert depth[0, 2] == pytest.approx(0.0)

@@ -329,6 +329,23 @@ def rasterize_land_mask(
         return None
 
 
+def ocean_depth_from_surface(
+    dem: np.ndarray,
+    ocean_mask: np.ndarray,
+    water_level: float,
+) -> np.ndarray:
+    """Water-column depth below the epoch water surface (m, ``>= 0``) on ocean pixels.
+
+    ``depth = clip(water_level - dem, 0, inf)`` inside ``ocean_mask``, else 0.
+
+    ``water_level`` is the epoch/basin surface in the SAME datum as ``dem``
+    (present global SL = 0).  Using the epoch surface — not the present 0 m datum —
+    is what makes a lowered decoupled basin read as a *shallower* body, so a
+    ~100 m drawdown is visible in the shading instead of looking as deep as today.
+    """
+    return np.where(ocean_mask, np.clip(water_level - dem, 0.0, None), 0.0)
+
+
 def build_epoch_mosaic(
     tile_paths: dict[str, str | Path],
     config: Optional[RenderConfig] = None,
