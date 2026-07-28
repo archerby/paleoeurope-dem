@@ -174,3 +174,155 @@ class TestFabdemLoader:
         loader = FabdemLoader(fabdem_dir)
         arr, transform, crs = loader.read_window((100.0, 10.0, 101.0, 11.0))
         assert arr is None
+
+
+# ===========================================================================
+# FabdemLoader index hygiene
+#
+# The GeoParquet index is a *machine-local cache*, never source.  Three ways it
+# used to lie:
+#   1. a stale index (tile paths recorded on another machine) was trusted verbatim;
+#   2. the in-memory cache lived on the class, so a second region loaded in the
+#      same process silently got the FIRST region's tiles — exactly the shape of
+#      a Pontic-then-Caspian run inside one process;
+#   3. a failed cache write was swallowed, so a full disk looked like success.
+# ===========================================================================
+
+
+def _write_tile(directory, name, bounds):
+    """Write a tiny 1-band GeoTIFF covering *bounds* — enough to index and read."""
+    import rasterio
+    from rasterio.transform import from_bounds as affine_from_bounds
+
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        height=8,
+        width=8,
+        count=1,
+        dtype="float32",
+        crs="EPSG:4326",
+        transform=affine_from_bounds(*bounds, 8, 8),
+    ) as dst:
+        dst.write(np.full((8, 8), 100.0, dtype=np.float32), 1)
+    return path
+
+
+@pytest.fixture
+def clean_index_cache():
+    """Drop the loader's in-memory index cache around the test."""
+    from paleoeurope.fusion.fabdem_loader import FabdemLoader
+
+    FabdemLoader.clear_index_cache()
+    yield
+    FabdemLoader.clear_index_cache()
+
+
+class TestFabdemLoaderIndexHygiene:
+    def test_stale_index_is_discarded_and_rebuilt(self, tmp_path, clean_index_cache):
+        """An index whose recorded tiles are gone must be rebuilt, with a warning."""
+        gpd = pytest.importorskip("geopandas")
+        from shapely.geometry import box as shapely_box
+
+        from paleoeurope.fusion.fabdem_loader import FabdemLoader
+
+        tile_dir = tmp_path / "fabdem"
+        real_tile = _write_tile(tile_dir, "N62E006_FABDEM_V1-2.tif", (6.0, 62.0, 7.0, 63.0))
+
+        # Index recorded on a machine that no longer exists — cf. the committed
+        # fabdem_index.parquet that pointed at /home/pp/... on a powered-off box.
+        dead = "/home/pp/paleo_project/tests/fixtures/fabdem/N62E006_FABDEM_V1-2_fixture.tif"
+        stale = gpd.GeoDataFrame(
+            [
+                {
+                    "path": dead,
+                    # Correct provenance, so only the dead path can make it stale.
+                    "fabdem_dir": str(tile_dir.resolve()),
+                    "minx": 6.0,
+                    "miny": 62.0,
+                    "maxx": 7.0,
+                    "maxy": 63.0,
+                    "geometry": shapely_box(6.0, 62.0, 7.0, 63.0),
+                }
+            ],
+            crs="EPSG:4326",
+        )
+        index_path = tmp_path / "fabdem_index.parquet"
+        stale.to_parquet(index_path)
+
+        with pytest.warns(UserWarning, match="stale"):
+            loader = FabdemLoader(tile_dir, index_path=index_path)
+
+        indexed = [rec["path"] for rec in loader._candidates(shapely_box(6.0, 62.0, 7.0, 63.0))]
+        assert dead not in indexed, "loader handed out a tile path from a powered-off machine"
+        assert str(real_tile) in indexed
+
+        arr, transform, crs = loader.read_window((6.0, 62.0, 7.0, 63.0))
+        assert arr is not None
+
+    def test_index_cache_is_keyed_by_directory(self, tmp_path, clean_index_cache):
+        """A second tile directory must not inherit the first directory's index."""
+        from shapely.geometry import box as shapely_box
+
+        from paleoeurope.fusion.fabdem_loader import FabdemLoader
+
+        pontic_dir = tmp_path / "pontic"
+        caspian_dir = tmp_path / "caspian"
+        _write_tile(pontic_dir, "N44E033_FABDEM_V1-2.tif", (33.0, 44.0, 34.0, 45.0))
+        caspian_tile = _write_tile(caspian_dir, "N45E050_FABDEM_V1-2.tif", (50.0, 45.0, 51.0, 46.0))
+
+        FabdemLoader(pontic_dir, index_path=tmp_path / "pontic.parquet")
+        caspian = FabdemLoader(caspian_dir, index_path=tmp_path / "caspian.parquet")
+
+        hits = [rec["path"] for rec in caspian._candidates(shapely_box(50.0, 45.0, 51.0, 46.0))]
+        assert str(caspian_tile) in hits, "second region was served the first region's index"
+
+        arr, transform, crs = caspian.read_window((50.0, 45.0, 51.0, 46.0))
+        assert arr is not None
+
+    def test_index_built_for_another_directory_is_discarded(self, tmp_path, clean_index_cache):
+        """One shared index_path must not serve the wrong region's tiles.
+
+        The on-disk twin of the class-level cache bug: with the default
+        ``fabdem_index.parquet``, a Pontic run leaves an index that a later
+        Caspian run would otherwise load and believe.
+        """
+        pytest.importorskip("geopandas")
+        from shapely.geometry import box as shapely_box
+
+        from paleoeurope.fusion.fabdem_loader import FabdemLoader
+
+        shared_index = tmp_path / "fabdem_index.parquet"
+        pontic_dir = tmp_path / "pontic"
+        caspian_dir = tmp_path / "caspian"
+        _write_tile(pontic_dir, "N44E033_FABDEM_V1-2.tif", (33.0, 44.0, 34.0, 45.0))
+        caspian_tile = _write_tile(caspian_dir, "N45E050_FABDEM_V1-2.tif", (50.0, 45.0, 51.0, 46.0))
+
+        FabdemLoader(pontic_dir, index_path=shared_index)
+        FabdemLoader.clear_index_cache()  # new process would start cold
+
+        with pytest.warns(UserWarning, match="stale"):
+            caspian = FabdemLoader(caspian_dir, index_path=shared_index)
+
+        hits = [rec["path"] for rec in caspian._candidates(shapely_box(50.0, 45.0, 51.0, 46.0))]
+        assert str(caspian_tile) in hits, "Caspian run was served the Pontic index"
+
+    def test_index_write_failure_warns(self, tmp_path, monkeypatch, clean_index_cache):
+        """A cache write that fails (e.g. full disk) must warn, not pass silently."""
+        gpd = pytest.importorskip("geopandas")
+
+        from paleoeurope.fusion.fabdem_loader import FabdemLoader
+
+        tile_dir = tmp_path / "fabdem"
+        _write_tile(tile_dir, "N62E006_FABDEM_V1-2.tif", (6.0, 62.0, 7.0, 63.0))
+
+        def _no_space(self, *args, **kwargs):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(gpd.GeoDataFrame, "to_parquet", _no_space, raising=True)
+
+        with pytest.warns(UserWarning, match="No space left on device"):
+            FabdemLoader(tile_dir, index_path=tmp_path / "fabdem_index.parquet")

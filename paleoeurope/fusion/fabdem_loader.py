@@ -15,6 +15,7 @@ Data DOI:  https://doi.org/10.5523/bris.25wfy0f9ukibjp75gb8laq1ghq
 from __future__ import annotations
 
 import re
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -47,8 +48,16 @@ class FabdemLoader:
     -----
     On first instantiation the loader scans ``fabdem_dir`` and builds a
     spatial index from tile filenames (fast, O(N)) or rasterio metadata
-    (slow fallback).  The index is cached in memory for the process lifetime
-    and optionally persisted to *index_path* as GeoParquet.
+    (slow fallback).  The index is cached in memory **per resolved tile
+    directory** for the process lifetime and optionally persisted to
+    *index_path* as GeoParquet.
+
+    The index is a machine-local *cache*, never source — it records absolute
+    tile paths and the directory it was built from.  Both are re-validated on
+    load, because an index that outlives its tiles (moved data, a different
+    machine, a second region sharing one *index_path*) otherwise yields either
+    a rasterio crash or, worse, a silently empty read.  See
+    :meth:`_staleness_reason`.  Do not commit the index to version control.
 
     FABDEM tiles use the convention ``Nxx Eyyyy`` — the letters indicate the
     SW corner of the tile, and each tile covers exactly 1° × 1°.
@@ -61,8 +70,14 @@ class FabdemLoader:
     (3600, 3600)
     """
 
-    _index_cache: object = None  # class-level in-memory cache
+    # In-memory index cache, keyed by resolved tile directory.  Keying by
+    # directory (rather than one index on the class) is what stops a second
+    # region loaded in the same process — a Pontic bbox then a Caspian bbox —
+    # from silently receiving the first region's tiles.
+    _index_cache: dict[Path, object] = {}
     _TILE_PATTERN = re.compile(r"([NS])(\d{2})([EW])(\d{3})")
+    #: Column recording which directory an index was built from.
+    _DIR_COLUMN = "fabdem_dir"
 
     def __init__(
         self,
@@ -75,27 +90,79 @@ class FabdemLoader:
         if not self.fabdem_dir.exists():
             raise FileNotFoundError(f"FABDEM directory not found: {fabdem_dir}")
 
-        if FabdemLoader._index_cache is not None:
-            self._index = FabdemLoader._index_cache
+        cache_key = self.fabdem_dir.resolve()
+        if cache_key in FabdemLoader._index_cache:
+            self._index = FabdemLoader._index_cache[cache_key]
         else:
             self._index = self._load_or_create_index()
-            FabdemLoader._index_cache = self._index
+            FabdemLoader._index_cache[cache_key] = self._index
 
     # ------------------------------------------------------------------
     # Index management
     # ------------------------------------------------------------------
 
+    @classmethod
+    def clear_index_cache(cls) -> None:
+        """Drop the in-memory index cache (all directories).
+
+        Useful after the tile directory changes on disk within one process,
+        and in tests.  The on-disk GeoParquet caches are left alone.
+        """
+        cls._index_cache.clear()
+
     def _load_or_create_index(self) -> object:
-        """Return spatial index as GeoDataFrame, loading or rebuilding as needed."""
-        if HAS_GEOPANDAS and self.index_path.exists():
-            try:
+        """Return the spatial index, rebuilding whenever the cache cannot be trusted."""
+        if not (HAS_GEOPANDAS and self.index_path.exists()):
+            return self._build_index()
 
-                return gpd.read_parquet(self.index_path)
-            except Exception as exc:  # pragma: no cover
-                import warnings
+        try:
+            gdf = gpd.read_parquet(self.index_path)
+        except Exception as exc:  # pragma: no cover
+            warnings.warn(
+                f"Cached FABDEM index {self.index_path} unreadable ({exc}), rebuilding."
+            )
+            return self._build_index()
 
-                warnings.warn(f"Cached index unreadable ({exc}), rebuilding.")
-        return self._build_index()
+        if "path" not in getattr(gdf, "columns", []) or len(gdf) == 0:
+            # Nothing to trust and nothing to complain about — just re-glob.
+            return self._build_index()
+
+        reason = self._staleness_reason(gdf)
+        if reason is not None:
+            warnings.warn(
+                f"Discarding stale FABDEM index {self.index_path}: {reason}. "
+                f"Rebuilding from {self.fabdem_dir}."
+            )
+            return self._build_index()
+
+        return gdf
+
+    def _staleness_reason(self, gdf: object) -> str | None:
+        """Return why *gdf* must not be trusted, or ``None`` if it is usable.
+
+        An index is stale when it was built somewhere else (different tile
+        directory, or before provenance was recorded at all) or when any tile
+        it names has since disappeared.  Both cases really happen: the index
+        used to be committed to git carrying absolute paths from a machine
+        that is now powered off.
+        """
+        resolved_dir = str(self.fabdem_dir.resolve())
+
+        if self._DIR_COLUMN not in gdf.columns:
+            return f"it records no {self._DIR_COLUMN!r} provenance"
+
+        recorded_dirs = sorted({str(v) for v in gdf[self._DIR_COLUMN]})
+        if recorded_dirs != [resolved_dir]:
+            return f"it was built for {recorded_dirs}, not {resolved_dir!r}"
+
+        missing = [str(p) for p in gdf["path"] if not Path(p).exists()]
+        if missing:
+            return (
+                f"{len(missing)} of {len(gdf)} recorded tiles no longer exist "
+                f"(e.g. {missing[0]!r})"
+            )
+
+        return None
 
     def _build_index(self) -> object:
         """Scan *fabdem_dir* and return a spatial index (GeoDataFrame or list)."""
@@ -130,6 +197,7 @@ class FabdemLoader:
             records.append(
                 {
                     "path": str(path),
+                    self._DIR_COLUMN: str(self.fabdem_dir.resolve()),
                     "minx": minx,
                     "miny": miny,
                     "maxx": maxx,
@@ -147,13 +215,18 @@ class FabdemLoader:
             r["geometry"] = shapely_box(r["minx"], r["miny"], r["maxx"], r["maxy"])
 
         gdf = gpd.GeoDataFrame(records, crs="EPSG:4326") if records else gpd.GeoDataFrame(
-            columns=["path", "geometry"], crs="EPSG:4326"
+            columns=["path", self._DIR_COLUMN, "geometry"], crs="EPSG:4326"
         )
 
         try:
             gdf.to_parquet(self.index_path)
-        except Exception:  # pragma: no cover
-            pass
+        except Exception as exc:
+            # Never swallow this: on a full disk the index simply never
+            # persists and every run silently re-globs the whole tile tree.
+            warnings.warn(
+                f"Could not persist FABDEM index to {self.index_path} "
+                f"({type(exc).__name__}: {exc}); it will be rebuilt on every run."
+            )
 
         return gdf
 
@@ -192,8 +265,16 @@ class FabdemLoader:
         if not candidates:
             return None, None, None
 
-        # Determine output dimensions
-        first_path = candidates[0]["path"]
+        # Determine output dimensions from the first tile that is actually
+        # readable — the index is validated on load, but tiles can still go
+        # away underneath a long-running process.
+        first_path = next((rec["path"] for rec in candidates if Path(rec["path"]).exists()), None)
+        if first_path is None:
+            raise FileNotFoundError(
+                f"FABDEM index lists {len(candidates)} tile(s) for bounds {bounds}, "
+                f"but none exist on disk (e.g. {candidates[0]['path']!r}). "
+                f"Delete {self.index_path} to force a rebuild."
+            )
         with rasterio.open(first_path) as src:
             res_x = src.res[0]
             src_crs = src.crs

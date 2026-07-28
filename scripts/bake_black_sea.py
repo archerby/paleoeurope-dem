@@ -33,17 +33,33 @@ ice_height = 0 everywhere (no ice sheet over the Black Sea).
 
 OUTPUT
 ------
-  D:/pasha/RESEARCH/renders/black_sea_corrected/topo/correct/{gradual,catastrophic}/*.png
-  D:/pasha/RESEARCH/renders/black_sea_corrected/topo/wrong/*.png
+  $PALEO_OUT_ROOT/black_sea_corrected/topo/correct/{gradual,catastrophic}/*.png
+  $PALEO_OUT_ROOT/black_sea_corrected/topo/wrong/*.png
   (QC gallery over all three: scripts/make_bs_qc_gallery.py -> topo/bs_qc_gallery.html)
 
+ROOTS
+-----
+Inputs and outputs are located through two environment variables so the same
+script runs on the Windows workstation and on the Linux compute box (findus,
+data under /mnt/tank):
+
+  * ``PALEO_DATA_ROOT`` — the Paleo-Europe_3D data tree (rasters, curves, shapes).
+    Default: the sibling ``Paleo-Europe_3D`` checkout next to this repo.
+  * ``PALEO_OUT_ROOT``  — where render trees are written.
+    Default: this repo's parent directory (the ``renders/`` root).
+
+Both defaults are derived from this file's location, so nothing is bound to a
+particular drive letter.
+
 Run (repo NOT pip-installed):
-    PYTHONPATH=/d/pasha/RESEARCH/renders/paleoeurope-dem \
-        python scripts/bake_black_sea.py
+    PYTHONPATH=$(pwd) python scripts/bake_black_sea.py
+    PALEO_DATA_ROOT=/mnt/tank/Paleo-Europe_3D PALEO_OUT_ROOT=/mnt/tank/renders \\
+        PYTHONPATH=$(pwd) python scripts/bake_black_sea.py
 """
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -77,27 +93,142 @@ from paleoeurope.viz.paleocostline_render import (
 # Paths & constants
 # ---------------------------------------------------------------------------
 
-BS_DEM = Path(
-    r"D:/pasha/RESEARCH/Paleo-Europe_3D/data/raw/GEBCO/bs_gmrt_bsproper.tif"
-)
-ICE6G_DIR = Path(r"D:/pasha/RESEARCH/Paleo-Europe_3D/data/raw/ICE6G")
-PONTIC_CSV = Path(
-    r"D:/pasha/RESEARCH/Paleo-Europe_3D/docs/superpowers/research"
-    r"/2026-06-21-black-sea-level-curve.csv"
+# Roots are resolved ONCE at import.  Defaults are derived from this file's
+# location (see module docstring) so no drive letter is baked in; override with
+# PALEO_DATA_ROOT / PALEO_OUT_ROOT when the trees live elsewhere (e.g. findus:
+# /mnt/tank).
+_DEFAULT_DATA_ROOT = _REPO_ROOT.parents[1] / "Paleo-Europe_3D"
+_DEFAULT_OUT_ROOT = _REPO_ROOT.parent
+
+PALEO_DATA_ROOT = Path(
+    os.environ.get("PALEO_DATA_ROOT") or _DEFAULT_DATA_ROOT
+).resolve()
+PALEO_OUT_ROOT = Path(os.environ.get("PALEO_OUT_ROOT") or _DEFAULT_OUT_ROOT).resolve()
+
+_RAW_DIR = PALEO_DATA_ROOT / "data" / "raw"
+
+BS_DEM = _RAW_DIR / "GEBCO" / "bs_gmrt_bsproper.tif"
+ICE6G_DIR = _RAW_DIR / "ICE6G"
+PONTIC_CSV = (
+    PALEO_DATA_ROOT
+    / "docs"
+    / "superpowers"
+    / "research"
+    / "2026-06-21-black-sea-level-curve.csv"
 )
 # Simplified curve: 0 ka -> 0 m (the full CSV has a +8.49 m present-datum offset
 # and must NOT be used for the global-eustatic reference frames).
-SPRATT_CSV = Path(
-    r"D:/pasha/RESEARCH/Paleo-Europe_3D/data/raw/sea_level_curves"
-    r"/spratt_lisiecki_2016_simplified.csv"
+SPRATT_CSV = (
+    _RAW_DIR / "sea_level_curves" / "spratt_lisiecki_2016_simplified.csv"
 )
-PALEOCOASTLINES_SHP = Path(
-    r"D:/pasha/RESEARCH/Paleo-Europe_3D/data/raw/paleocostline"
-    r"/Paleocoastlines/Paleocoastlines/Paleocoastlines.shp"
+PALEOCOASTLINES_SHP = (
+    _RAW_DIR
+    / "paleocostline"
+    / "Paleocoastlines"
+    / "Paleocoastlines"
+    / "Paleocoastlines.shp"
 )
 
-OUT_BASE = Path(r"D:/pasha/RESEARCH/renders/black_sea_corrected/topo")
+OUT_BASE = PALEO_OUT_ROOT / "black_sea_corrected" / "topo"
+# Intermediate per-epoch GeoTIFFs are a rebuildable cache; they stay inside the
+# repo's own outputs/ tree (already repo-relative, never drive-absolute).
 PALEO_TIF_DIR = _REPO_ROOT / "outputs" / "_bs_paleo"
+
+# DATUM-SANITY window (m vs present global SL) per closed basin, consulted by
+# _check_datum_sanity().  Adding a basin = adding a row here; the logic is generic.
+#   pontic  — the cited Neoeuxinian/Pontic curve never rises above present SL.
+#   caspian — deep Khvalynian lowstands reach ~-100 m; the upper bound admits the
+#             defensible +35 m highstand (HESS 2024) and the UNDATED +48/+50 m cap.
+#
+# This window catches datum blow-ups and unit errors ONLY.  It is NOT a sign
+# guard: the Caspian legitimately takes both signs, so every rung of the
+# Khvalynian ladder (+48/+50, +34/+36, +20/+22, +14/+15, +4/+6, 0/-2, -5/-6,
+# -10/-12, -16/-17) has a mirror twin that also lands inside -160..+60.  Sign
+# flips are detected at CURVE level — see validate_basin_curve().
+_DATUM_SANITY_RANGE_M: dict[str, tuple[float, float]] = {
+    "pontic": (-150.0, 1.0),
+    "caspian": (-160.0, 60.0),
+}
+
+# Present-day (0 ka) surface of each basin as (anchor_m, tolerance_m).  These are
+# measured, not modelled:
+#   pontic  — connected to the world ocean, so 0 m by definition of the datum.
+#   caspian — the modern Caspian Sea surface sits ~28 m BELOW global sea level;
+#             the tolerance absorbs its metre-scale historical drift.
+_PRESENT_DAY_ANCHOR_M: dict[str, tuple[float, float]] = {
+    "pontic": (0.0, 2.0),
+    "caspian": (-28.0, 6.0),
+}
+
+# How close a curve row must sit to 0 ka to count as the present-day anchor.
+_ANCHOR_AGE_TOL_KA = 0.25
+
+# The Manych spillway sill that the Khvalynian Caspian had to overtop to drain
+# west into the Pontic basin (m vs present global SL).
+#
+# PROVENANCE: measured 2026-07-28 from GEBCO 2024 (15 arcsec grid) at the
+# saddle point 44.119 E / 45.773 N — the lowest point along the Kuma-Manych
+# depression between the Caspian and Pontic basins.  Not a literature quote:
+# this is the number our own DEM gives, so a curve is checked against the same
+# topography the render uses.
+#
+# This is the THRESHOLD Check A tests against, not merely a number quoted in the
+# message.  A Khvalynian *spillway* curve that peaks below it never spills, and
+# is therefore not describing the event this render is about.
+MANYCH_SILL_M = 23.0
+
+# Check B — physical continuity.  Maximum |dlevel| / |dage| (m per ka) allowed
+# between age-sorted adjacent samples of a closed-basin curve.  A closed-basin
+# water surface cannot jump arbitrarily; a sign error confined to a BLOCK of
+# rows leaves a large discontinuity at each edge of that block, and that is what
+# this catches.
+#
+# The constants are per basin because ONE constant provably cannot do both jobs:
+#
+#   pontic  — MEASURED on the shipped curve
+#             (docs/superpowers/research/2026-06-21-black-sea-level-curve.csv),
+#             both scenarios, 2026-07-28:
+#               gradual      max 100.000 m/ka  (9.4 -> 9.5 ka, -30 -> -40 m:
+#                                               the reconnection at the sill)
+#               catastrophic max 226.857 m/ka  (7.15 -> 7.5 ka, -20.6 -> -100 m:
+#                                               the Ryan-Pitman catastrophic
+#                                               reconnection; note the 7.15 ka
+#                                               anchor also sits on a 14C axis,
+#                                               which inflates this rate)
+#             Limit 340 m/ka = 1.50x the measured worst case.  The meltwater
+#             rise into 16.5 ka (56.8 m/ka) clears it by 6x.
+#
+#   caspian — no real curve exists yet, so the limit is anchored to the fastest
+#             DOCUMENTED Caspian event rather than to the ladder's own spacing:
+#             kurbanov2020's Early Khvalynian rise, "~-150 to >+40 m a.s.l."
+#             across the 17-13 ka window = ~47.5 m/ka (~62.5 m/ka on the
+#             Bezrodnykh +100 m variant).  Limit 100 m/ka = 2.1x that (1.6x on
+#             the Bezrodnykh variant), and LETHAL to the arslanov2016 subset
+#             flip AT 0.5-KA SPACING: negating the +48/+50 cap next to the
+#             +34/+36 Talginka rung is an 82-86 m step across 0.5 ka =
+#             164-172 m/ka, i.e. 1.64-1.72x ABOVE the limit.
+#
+# WHY NOT ONE CONSTANT: the Pontic curve genuinely contains a 226.857 m/ka
+# event, while the attack we must kill is only 164 m/ka.  Any single constant
+# loose enough to admit the real curve is also loose enough to admit the typo.
+# Stating that plainly rather than picking a number that satisfies neither.
+#
+# THESE VALUES MUST STAY IDENTICAL to _MAX_LEVEL_RATE_M_PER_KA in
+# Paleo-Europe_3D/scripts/export_bs_levels.py.  They diverged once already
+# (engine 340/120 vs viewer 300/100), which meant a curve the viewer accepted
+# the engine rejected.  Reconciled 2026-07-28 by taking the safer margin on
+# each side: the Pontic limit is the more permissive of the two (a false
+# REJECTION would break the one basin that already works), the Caspian limit is
+# the tighter and better-sourced of the two (it cites a real published rise
+# rate instead of the fixture's own spacing).
+#
+# RE-MEASURE THE CASPIAN VALUE when _build_caspian_curve.py lands: if the real
+# curve contains a genuine Manych drawdown above 100 m/ka the constant must go
+# up, and the arslanov2016 regression test must then be re-checked for lethality.
+_MAX_LEVEL_RATE_M_PER_KA: dict[str, float] = {
+    "pontic": 340.0,
+    "caspian": 100.0,
+}
 
 # On the ICE-6G 0.5-ka grid (only ages with an I6_C.VM5a_10min.<age>.nc file),
 # chosen to sample the cited curve's load-bearing features: 22 LGM min (-120),
@@ -129,25 +260,246 @@ def _epoch_filename(epoch: float) -> str:
     return f"I6_C.VM5a_10min.{epoch}.nc"
 
 
-def pontic_level(df: pd.DataFrame, epoch: float, scenario: str = "gradual") -> float:
-    """Nearest-age Pontic basin level (m vs present global SL) for *epoch*.
+def _check_datum_sanity(level: float, basin: str, where: str) -> float:
+    """Reject *level* if it is outside ``_DATUM_SANITY_RANGE_M[basin]``.
+
+    This is a DATUM-SANITY bound, nothing more.  It catches datum blow-ups and
+    unit errors — a level of -3000 m (metres read as decimetres, or an
+    ellipsoid/geoid mix-up) or +900 m — and it catches an out-of-window value in
+    a basin that only ever takes one sign.
+
+    **This cannot detect a sign flip in a two-signed basin.**  The Caspian is
+    two-signed: the Khvalynian ladder runs from +48/+50 m down to -16/-17 m, so
+    negating any rung lands inside the same symmetric window and is accepted.  A
+    magnitude window can never see that.  Curve-level validation does — see
+    :func:`validate_basin_curve`.
+
+    *where* is a short human label (``"14.0 ka"``, ``"row 7"``) used in the
+    message.  Raises ``ValueError`` rather than asserting — ``assert`` is
+    stripped under ``python -O`` and this guard protects a scientific invariant.
+    """
+    if basin not in _DATUM_SANITY_RANGE_M:
+        raise ValueError(
+            f"unknown basin {basin!r}; known basins={sorted(_DATUM_SANITY_RANGE_M)}"
+        )
+    lo, hi = _DATUM_SANITY_RANGE_M[basin]
+    if not lo <= level <= hi:
+        raise ValueError(
+            f"{basin} level {level:+.1f} m at {where} is outside the datum-sanity "
+            f"window {lo:+.1f}..{hi:+.1f} m — datum / unit blow-up (curve doc §3). "
+            "This bound does NOT check the sign of the curve; "
+            "validate_basin_curve() does that."
+        )
+    return level
+
+
+def validate_basin_curve(
+    df: pd.DataFrame,
+    basin: str,
+    scenario: str = "gradual",
+    require_spillway_highstand: bool = True,
+) -> None:
+    """Validate a whole closed-basin level curve; call ONCE at load time.
+
+    This is the real sign-flip guard.  A per-scalar magnitude window cannot see a
+    sign flip in a basin that legitimately takes both signs (see
+    :func:`_check_datum_sanity`), so the discriminating information has to come
+    from the curve as a whole.  Checks, in the order they run:
+
+    1. **Mirror test** — if a near-present value fits the known present-day
+       anchor BETTER when negated, the curve is flipped.  Basin-agnostic: it
+       needs no hand-maintained ladder, only the anchor.
+    2. **Anchor check** — every near-present value must match the measured
+       present-day surface (Pontic 0 m ±2, Caspian -28 m ±6).
+    3. **Check A, spillway highstand** (Caspian only, opt-out via
+       *require_spillway_highstand*) — a curve describing the Khvalynian
+       transgression must PEAK AT OR ABOVE the measured Manych sill,
+       ``MANYCH_SILL_M`` = +23.00 m (GEBCO 2024, 44.119 E / 45.773 N).  Below
+       that the basin never spills west into the Pontic, so the curve is not
+       describing the event this render is about.  The threshold and the message
+       are the same number on purpose.
+    4. **Check B, physical continuity** — ``|dlevel| / |dage|`` between
+       age-sorted ADJACENT samples must stay under
+       ``_MAX_LEVEL_RATE_M_PER_KA[basin]``.  A closed-basin surface cannot jump
+       arbitrarily, so a sign error confined to a BLOCK of rows shows up as a
+       large discontinuity at each edge of the block.  This is the only check
+       that reads the whole curve pairwise, and it is what catches the
+       arslanov2016 typo (only the +48/+50 rows negated).
+    5. **Datum sanity, every row** — blow-ups and unit errors anywhere.
+
+    Sign diagnosis runs BEFORE datum sanity on purpose: a flipped curve usually
+    trips the datum window as well, and "out of range" would be a misleading
+    diagnosis for what is actually a sign error.
+
+    KNOWN LIMIT — what each check actually reads, and what stays invisible:
+
+    * Mirror and anchor read ONLY the rows within ``_ANCHOR_AGE_TOL_KA`` of
+      0 ka (all of them, not just the nearest).  They say nothing whatever about
+      any older row.
+    * Check A reads ONLY ``max(curve)`` — a single extremum.  It cannot see a
+      flip that leaves some rung above +23 m standing.
+    * Check B reads every ADJACENT age-sorted pair, so it sees block edges, but
+      it is blind to any error that is *smooth*: a whole-curve negation (no edge
+      at all — caught by mirror/anchor/datum instead), a uniform datum shift, a
+      unit error, and — importantly — a sign flip of a block whose values are
+      small enough that the induced step stays under the per-basin limit.
+      Concretely, for the Caspian limit of 120 m/ka at the ladder's 0.5-ka
+      spacing, negating a rung of |level| < ~30 m in a locally flat neighbourhood
+      is INVISIBLE to Check B; it is covered only if it also drags ``max`` below
+      the sill (Check A) or moves the anchor.  We do not claim that class.
+    * Duplicate ages (``dage == 0``) yield no defined rate and are SKIPPED by
+      Check B.  Duplicates inside the anchor window are still fully checked by
+      mirror/anchor; duplicates elsewhere are not covered.
+    * Where the anchor is exactly 0 m (the Pontic basin, connected to the world
+      ocean) the mirror test is structurally blind — negating 0 gives -0.0, so
+      both fits are 0 m.  A flipped Pontic curve is rejected by the datum window
+      instead, which works because that basin IS single-signed and its window is
+      asymmetric (-150..+1 m).  It is the COMBINATION that covers both basin
+      types; no single check suffices.
+
+    Raises ``ValueError`` on the first violation; returns ``None`` when the curve
+    is usable.  ``_build_caspian_curve.py`` is required to pass this.
+    """
+    if basin not in _DATUM_SANITY_RANGE_M:
+        raise ValueError(
+            f"unknown basin {basin!r}; known basins={sorted(_DATUM_SANITY_RANGE_M)}"
+        )
+    col = f"level_m_global_{scenario}"
+    if col not in df.columns:
+        raise ValueError(
+            f"unknown scenario {scenario!r}; available columns={list(df.columns)}"
+        )
+
+    curve = pd.to_numeric(df[col], errors="coerce")
+    ages = pd.to_numeric(df["age_ka"], errors="coerce")
+    ok = curve.notna() & ages.notna()
+    if not ok.any():
+        raise ValueError(f"{basin}/{scenario} curve has no usable (age, level) rows")
+    curve, ages = curve[ok], ages[ok]
+
+    # --- present-day anchor rows -------------------------------------------
+    # EVERY row inside the tolerance is examined, not just min(|age|): a
+    # duplicated near-present row carrying a flipped value used to hide behind
+    # the untouched one.
+    anchor_m, anchor_tol = _PRESENT_DAY_ANCHOR_M[basin]
+    age_gap = ages.abs()
+    in_window = age_gap <= _ANCHOR_AGE_TOL_KA
+    if not bool(in_window.any()):
+        idx_near = age_gap.idxmin()
+        raise ValueError(
+            f"{basin}/{scenario} curve has no 0 ka anchor row (nearest age is "
+            f"{float(ages.loc[idx_near]):.2f} ka) — cannot validate the sign of "
+            "the curve without the present-day anchor"
+        )
+    anchor_idx = list(ages.index[in_window])
+
+    # --- 1. mirror test (basin-agnostic), over ALL anchor-window rows -------
+    for idx0 in anchor_idx:
+        at0 = float(curve.loc[idx0])
+        fit, flipped_fit = abs(at0 - anchor_m), abs(-at0 - anchor_m)
+        if fit > flipped_fit:
+            raise ValueError(
+                f"{basin}/{scenario} curve at {float(ages.loc[idx0]):g} ka (inside "
+                f"the 0 ka anchor window) is {at0:+.1f} m but the measured "
+                f"present-day anchor is {anchor_m:+.1f} m; the curve fits the "
+                f"anchor better when negated (|{at0:+.1f} - {anchor_m:+.1f}| = "
+                f"{fit:.1f} m vs |{-at0:+.1f} - {anchor_m:+.1f}| = "
+                f"{flipped_fit:.1f} m) — this is a SIGN FLIP, not a highstand"
+            )
+
+    # --- 2. anchor check, over ALL anchor-window rows -----------------------
+    for idx0 in anchor_idx:
+        at0 = float(curve.loc[idx0])
+        fit = abs(at0 - anchor_m)
+        if fit > anchor_tol:
+            raise ValueError(
+                f"{basin}/{scenario} curve at {float(ages.loc[idx0]):g} ka (inside "
+                f"the 0 ka anchor window) is {at0:+.1f} m, off the measured "
+                f"present-day anchor {anchor_m:+.1f} m by {fit:.1f} m "
+                f"(tolerance {anchor_tol:.1f} m) — wrong datum or wrong basin"
+            )
+
+    # --- 3. Check A: the highstand must clear the Manych sill (Caspian) -----
+    if basin == "caspian" and require_spillway_highstand:
+        peak = float(curve.max())
+        if not peak >= MANYCH_SILL_M:
+            raise ValueError(
+                f"caspian/{scenario} curve highstand is only {peak:+.1f} m, below "
+                f"the measured Manych sill {MANYCH_SILL_M:+.2f} m (GEBCO 2024, "
+                "44.119 E / 45.773 N): a Khvalynian transgression must clear the "
+                "sill to spill west into the Pontic basin, so this curve is "
+                "flipped, squashed, or is not describing a spilling interval — "
+                "pass require_spillway_highstand=False for a deliberately "
+                "non-spilling Caspian interval"
+            )
+
+    # --- 4. Check B: physical continuity between adjacent samples -----------
+    # Non-finite rows are filtered HERE ONLY, so that +inf still reaches the
+    # datum window below instead of being silently dropped from the curve.
+    a_all = ages.to_numpy(dtype=float)
+    l_all = curve.to_numpy(dtype=float)
+    finite = np.isfinite(a_all) & np.isfinite(l_all)
+    a_fin, l_fin = a_all[finite], l_all[finite]
+    order = np.argsort(a_fin, kind="stable")
+    a_sorted, l_sorted = a_fin[order], l_fin[order]
+    max_rate = _MAX_LEVEL_RATE_M_PER_KA[basin]
+    for i in range(len(a_sorted) - 1):
+        d_age = float(a_sorted[i + 1] - a_sorted[i])
+        if d_age <= 0.0:
+            continue  # duplicate ages: no defined rate (see KNOWN LIMIT)
+        d_level = float(l_sorted[i + 1] - l_sorted[i])
+        rate = abs(d_level) / d_age
+        if rate > max_rate:
+            raise ValueError(
+                f"{basin}/{scenario} curve jumps {d_level:+.1f} m between "
+                f"{float(a_sorted[i]):g} ka ({float(l_sorted[i]):+.1f} m) and "
+                f"{float(a_sorted[i + 1]):g} ka ({float(l_sorted[i + 1]):+.1f} m) "
+                f"— {rate:.1f} m/ka, over the {basin} continuity limit of "
+                f"{max_rate:.1f} m/ka.  A closed-basin surface cannot move that "
+                "fast; a discontinuity this large at a block edge is the "
+                "signature of a SIGN FLIP confined to part of the curve (the "
+                "arslanov2016 '-48 to -50' typo for the +48/+50 rungs)"
+            )
+
+    # --- 5. datum sanity, every row ----------------------------------------
+    for age, level in zip(ages, curve):
+        _check_datum_sanity(float(level), basin, f"{float(age):g} ka")
+
+
+def basin_level(
+    df: pd.DataFrame,
+    epoch: float,
+    scenario: str = "gradual",
+    basin: str = "pontic",
+) -> float:
+    """Nearest-age closed-basin level (m vs present global SL) for *epoch*.
 
     *scenario* selects the reconnection column (``gradual`` or ``catastrophic``).
-    A sign-flip guard asserts the level is at or below present sea level (curve §3):
-    a positive value would put the shoreline above the surrounding terrain.
+    *basin* selects the datum-sanity window applied to the returned scalar.  That
+    window is a blow-up guard only — the sign of the curve is validated once, at
+    load time, by :func:`validate_basin_curve`.
     """
     col = f"level_m_global_{scenario}"
     if col not in df.columns:
         raise ValueError(
             f"unknown scenario {scenario!r}; available columns={list(df.columns)}"
         )
+    if basin not in _DATUM_SANITY_RANGE_M:
+        raise ValueError(
+            f"unknown basin {basin!r}; known basins={sorted(_DATUM_SANITY_RANGE_M)}"
+        )
     idx = (df["age_ka"] - float(epoch)).abs().idxmin()
     level = float(df.loc[idx, col])
-    assert level <= 1.0, (
-        f"basin level {level:+.1f} m > +1 m at {epoch} ka — sign-flip guard "
-        "(curve doc §3)"
-    )
-    return level
+    return _check_datum_sanity(level, basin, f"{float(epoch):g} ka")
+
+
+def pontic_level(df: pd.DataFrame, epoch: float, scenario: str = "gradual") -> float:
+    """Nearest-age **Pontic** basin level (m vs present global SL) for *epoch*.
+
+    Thin wrapper over :func:`basin_level` pinned to the ``pontic`` range, kept for
+    the Black-Sea callers.  Same values and same nearest-age selection as before.
+    """
+    return basin_level(df, epoch, scenario, basin="pontic")
 
 
 def gia_delta_subset(epoch: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -233,6 +585,10 @@ def build_paleo_dem(epoch: float) -> Path:
 
 def main() -> None:
     pontic_df = pd.read_csv(PONTIC_CSV, comment="#")
+    # Validate the curve ONCE, before any epoch lookup: sign flips are only
+    # detectable on the curve as a whole, never on an individual scalar.
+    for scenario in SCENARIOS:
+        validate_basin_curve(pontic_df, "pontic", scenario)
 
     cfg = RenderConfig(max_px=2000, ice_model_label="ICE-6G_C")
 

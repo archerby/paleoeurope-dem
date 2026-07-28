@@ -41,6 +41,11 @@ outputs/
 *.aux.xml
 *.ovr
 
+# FABDEM spatial index — machine-local CACHE, not source. It stores absolute
+# tile paths, so a committed copy points at another machine's filesystem and
+# breaks every fusion run that trusts it. Rebuilt automatically on first use.
+fabdem_index.parquet
+
 # OS
 .DS_Store
 Thumbs.db
