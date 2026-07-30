@@ -72,17 +72,47 @@ def test_fusion_then_gia_pipeline(fabdem_dir, gebco_path, ice6g_path, tmp_path, 
     win = read_geotiff(fusion_out)
 
     loader = Ice6gLoader(ice6g_path)
-    lats, lons, dz, ice_h = loader.get_fields(epoch_ka=21, bounds=tile_bounds)
+    # ICE6G_fixture.nc is a 66×67 REGIONAL cut (57–68 N / 1–12 E), so it holds no
+    # ice-free tropical continental land and cannot derive the global sea-surface
+    # datum. Supply the value measured once from the global file at 21 ka. See
+    # ``Ice6gLoader.get_fields``'s ``sea_surface_offset`` docs for why this is an
+    # explicit argument rather than a silent fallback.
+    lats, lons, dz, ice_h = loader.get_fields(
+        epoch_ka=21, bounds=tile_bounds, sea_surface_offset=87.33
+    )
 
     tile_lats, tile_lons = make_pixel_coords(tile_bounds, win.data.shape)
     paleo, ice_mask = apply_gia_delta(win.data, lats, lons, dz, ice_h, tile_lats, tile_lons)
 
     assert paleo.shape == win.data.shape
     assert paleo.dtype == np.float32
-    # Tile N62E006 (62-63°N, Sunnmøre) is fully under the Fennoscandian ice sheet
-    # at 21 ka — expect significant GIA delta and ice-covered pixels.
-    # dz comes from stgr = Topo[21ka] − Topo[0ka] in the real ICE-6G fixture.
-    assert np.abs(dz).max() > 0.0, "GIA delta must be non-zero for 21 ka over Scandinavia"
+
+    # Rewritten 2026-07-30. This used to assert ``np.abs(dz).max() > 0`` with the
+    # comment "dz comes from stgr = Topo[21ka] − Topo[0ka]". Both halves are now
+    # wrong: ``stgr`` is retired (bare ΔTopo double-counts the eustatic term), and
+    # over this tile there is no bedrock signal that *could* be non-zero.
+    #
+    # Tile N62E006 (62–63 N, Sunnmøre) sits under 3000 m of Fennoscandian ice at
+    # 21 ka. ICE-6G ``Topo`` there is the ICE SURFACE, not the solid surface, so
+    # ``solid_displacement`` correctly returns NaN — "unknown", not "no rebound".
+    # The old assertion passed on an ice-column step of order +1800 m being fed in
+    # as bedrock, which ``correction_pipeline`` would then stack ICE-7G thickness
+    # on top of, counting the ice twice.
+    #
+    # LIMITATION THIS PINS: for any formerly glaciated region (Scandinavia,
+    # Doggerland, Europe) ICE-6G ``Topo`` cannot supply bedrock GIA at all; that
+    # needs ICE-7G bedrock or an equivalent product. The Khvalynian/Pontic scene
+    # is ice-free at every epoch, so it is unaffected.
+    assert np.all(np.isnan(dz)), (
+        "tile N62E006 is fully glaciated at 21 ka, so every dz cell must be NaN "
+        f"(unknown bedrock); got {np.count_nonzero(~np.isnan(dz))} finite cells — "
+        "an ice-surface elevation is leaking through as if it were bedrock"
+    )
+    assert np.all(ice_h > 0.0), "the same tile must report ice thickness everywhere"
+    assert not np.any(dz == 0.0), (
+        "NaN must never be zero-filled: 0.0 reads as 'measured no rebound', which "
+        "is a false measurement rather than a neutral placeholder"
+    )
 
 
 def test_reproducibility_seed_42(fabdem_dir, gebco_path, tmp_path, tile_bounds, tile_id):

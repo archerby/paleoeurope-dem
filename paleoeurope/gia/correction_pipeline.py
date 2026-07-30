@@ -54,7 +54,12 @@ from paleoeurope.gia.ice7g_loader import Ice7gLoader
 from paleoeurope.ice.envelope import apply_envelope_method
 from paleoeurope.utils.raster import RasterWindow, read_geotiff
 
-__all__ = ["run_single_tile_epochs", "EpochResult"]
+__all__ = [
+    "run_single_tile_epochs",
+    "EpochResult",
+    "UnknownGiaCorrectionError",
+    "GIA_NAN_POLICIES",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +67,46 @@ logger = logging.getLogger(__name__)
 DEFAULT_PADDING_DEG: float = 0.5   # bbox padding for correction matrix extent
 DEFAULT_ICE_SIGMA: float = 1.5     # Gaussian σ for ice-thickness smoothing
 DEFAULT_ICE_THRESHOLD_M: float = 10.0  # pixels with ice > 10 m get surface overlay
+
+#: Accepted values for ``run_single_tile_epochs(gia_nan_policy=...)``.
+#:
+#: ``"raise"`` (default)
+#:     Any unknown Δz cell aborts the tile with
+#:     :class:`UnknownGiaCorrectionError`.  Correct for every tile that should be
+#:     ice-free at the epoch — the Black Sea / Manych corridor, all of the
+#:     Khvalynian work — where an unknown cell means a bug or the wrong epoch,
+#:     not a fact about the world.
+#: ``"nodata"``
+#:     The legitimate case: a tile that genuinely straddles a palaeo-ice margin
+#:     (Fennoscandia at 21 ka).  Unknown cells are written as the tile's declared
+#:     nodata value and reported in ``EpochResult.gia_unknown_mask``.  They are
+#:     never written as 0 m of correction and never left as a bare NaN inside a
+#:     raster whose header declares a different nodata.
+#:
+#: There is deliberately no ``"zero"`` policy.
+GIA_NAN_POLICIES: tuple[str, ...] = ("raise", "nodata")
+
+
+class UnknownGiaCorrectionError(ValueError):
+    """``dz_tile`` holds cells with no solid-surface displacement at all.
+
+    ICE-6G ``Topo`` is the **ice surface** wherever the icemask is set, so
+    :func:`paleoeurope.gia.ice6g_topo.solid_displacement` returns NaN there and
+    these files ship no bedrock-under-ice field to fall back on.  Adding such a
+    cell to a modern DEM is meaningless; zero-filling it first — which
+    ``read_correction_matrix`` used to do — is worse, because the result then reads
+    as "this ground did not move" over exactly the formerly glaciated ground that
+    moved the most.
+
+    Resolve it by one of:
+
+    * restricting the tile/epoch to ice-free ground (what every Khvalynian /
+      Black Sea tile already is);
+    * sourcing Δz from ICE-7G's bedrock-deformation field, the same source this
+      module already uses for thickness;
+    * passing ``gia_nan_policy="nodata"`` to accept the hole and have it recorded
+      as nodata — an honest "unknown", not a number.
+    """
 
 
 class EpochResult:
@@ -75,14 +120,23 @@ class EpochResult:
     ice_mask : np.ndarray     Bool array – True where ice was present.
     ice_h_tile : np.ndarray   Ice thickness on the tile grid (m, float32).
     paleo_bedrock : np.ndarray  Bedrock surface before ice overlay (m, float32).
-    dz_min : float            Minimum GIA bedrock Δz on model field (m).
-    dz_max : float            Maximum GIA bedrock Δz on model field (m).
+                              NaN where the GIA correction is unknown.
+    dz_min : float            Minimum GIA bedrock Δz over the **known** cells of
+                              the model field (m); NaN only if none are known.
+    dz_max : float            Maximum GIA bedrock Δz over the known cells (m).
+    gia_unknown_mask : np.ndarray
+                              Bool array — True where no solid-surface
+                              displacement exists because ICE-6G ``Topo`` is the
+                              ice surface there.  These cells are *unknown*, not
+                              zero; they are written to the paleo tile as its
+                              nodata value.  All-False for ice-free tiles and for
+                              epoch 0.
     """
 
     __slots__ = (
         "epoch_ka", "paleo_path", "ice_path",
         "ice_mask", "ice_h_tile", "paleo_bedrock",
-        "dz_min", "dz_max",
+        "dz_min", "dz_max", "gia_unknown_mask",
     )
 
     def __init__(
@@ -95,6 +149,7 @@ class EpochResult:
         paleo_bedrock: np.ndarray,
         dz_min: float,
         dz_max: float,
+        gia_unknown_mask: np.ndarray | None = None,
     ) -> None:
         self.epoch_ka      = epoch_ka
         self.paleo_path    = paleo_path
@@ -104,6 +159,11 @@ class EpochResult:
         self.paleo_bedrock = paleo_bedrock
         self.dz_min        = dz_min
         self.dz_max        = dz_max
+        self.gia_unknown_mask = (
+            np.zeros(np.shape(ice_mask), dtype=bool)
+            if gia_unknown_mask is None
+            else gia_unknown_mask
+        )
 
     def to_dict(self) -> dict:
         """Return a dict compatible with the legacy *epochs_data* format."""
@@ -113,6 +173,7 @@ class EpochResult:
             "paleo_bedrock": self.paleo_bedrock,
             "dz_min":        self.dz_min,
             "dz_max":        self.dz_max,
+            "gia_unknown_mask": self.gia_unknown_mask,
         }
 
 
@@ -131,6 +192,7 @@ def run_single_tile_epochs(
     transition_depth_m: float = 200.0,
     cm_res_deg: float = CM_RESOLUTION_DEG,
     compress: str = "lzw",
+    gia_nan_policy: str = "raise",
     verbose: bool = True,
 ) -> dict[float, EpochResult]:
     """Apply GIA correction for each epoch and write output tiles.
@@ -175,6 +237,10 @@ def run_single_tile_epochs(
         Correction matrix resolution in degrees.  Default ``1/360`` (10 arcsec).
     compress : str, optional
         GeoTIFF compression codec.  Default ``'lzw'``.
+    gia_nan_policy : {'raise', 'nodata'}, optional
+        What to do when ``dz_tile`` contains cells with no solid-surface
+        displacement — see :data:`GIA_NAN_POLICIES`.  Default ``'raise'``.
+        Zero-filling is not on offer in either mode.
     verbose : bool, optional
         Print progress messages.  Default ``True``.
 
@@ -183,7 +249,38 @@ def run_single_tile_epochs(
     dict[float, EpochResult]
         Mapping from epoch (ka) to an :class:`EpochResult` object.
         Call ``.to_dict()`` on each value for the legacy ``epochs_data`` format.
+
+    Raises
+    ------
+    UnknownGiaCorrectionError
+        With ``gia_nan_policy='raise'``, when the GIA correction is unknown over
+        any cell of the tile (ICE-6G ``Topo`` is the ice surface there).
+    ValueError
+        If *gia_nan_policy* is not one of :data:`GIA_NAN_POLICIES`, or if the
+        ICE-7G thickness read yields non-finite cells (thickness has no
+        legitimate "unknown": the sidecar declares ``nodata=0.0``, so a NaN there
+        would be silently written as *ice-free*, dropping ice rather than
+        flagging it).
+
+    Notes
+    -----
+    Unknown-value policy.  ``dz_tile`` comes from
+    :func:`~paleoeurope.gia.correction_matrix.read_correction_matrix`, which as of
+    2026-07-30 is NaN-preserving.  Before that it ended in
+    ``np.nan_to_num(result, nan=0.0)``, so the ice-surface guard in
+    :func:`~paleoeurope.gia.ice6g_topo.solid_displacement` never reached
+    production: an unknown Δz became ``0.0`` and ``paleo_bedrock = modern + 0``
+    silently claimed the ground had not moved.  Nothing in this function may
+    convert an unknown cell into a number; it either aborts or records nodata.
     """
+    if gia_nan_policy not in GIA_NAN_POLICIES:
+        raise ValueError(
+            f"gia_nan_policy={gia_nan_policy!r} is not one of {GIA_NAN_POLICIES}. "
+            "There is no zero-fill policy: 0.0 is a legitimate measured Δz_GIA, so "
+            "filling an unknown cell with it would record 'this ground did not "
+            "move' over formerly glaciated ground."
+        )
+
     fusion_path = Path(fusion_path)
     ice6g_path  = Path(ice6g_path)
     ice7g_path  = Path(ice7g_path)
@@ -293,11 +390,58 @@ def run_single_tile_epochs(
             nodata_val = float(tile_profile.get("nodata", -9999.0))
             nodata_mask = np.isnan(win.data) | (win.data.astype(np.float32) == np.float32(nodata_val))
 
+            # ── Unknown Δz policy ────────────────────────────────────────────
+            # NaN here means "ICE-6G Topo is the ice surface, there is no solid
+            # surface in these files", not "no correction".  It must never be
+            # added to the DEM as a number, and it must never reach the output
+            # raster as a bare NaN under a header that declares nodata=-9999.
+            gia_unknown = ~np.isfinite(dz_tile)
+            n_gia_unknown = int(np.count_nonzero(gia_unknown & ~nodata_mask))
+            if n_gia_unknown:
+                detail = (
+                    f"epoch {epoch_ka} ka, tile {tile_id}: the GIA correction is "
+                    f"unknown over {n_gia_unknown} of {gia_unknown.size} cells "
+                    f"({100.0 * n_gia_unknown / gia_unknown.size:.1f}%) that hold "
+                    "valid modern elevation, because ICE-6G 'Topo' is the ICE "
+                    "SURFACE there and these files carry no bedrock-under-ice "
+                    "field."
+                )
+                if gia_nan_policy == "raise":
+                    raise UnknownGiaCorrectionError(
+                        detail
+                        + "  Restrict this tile/epoch to ice-free ground, take Δz "
+                        "from ICE-7G's bedrock-deformation field, or pass "
+                        "gia_nan_policy='nodata' to record the hole as nodata.  It "
+                        "will not be filled with 0 m."
+                    )
+                logger.warning(
+                    "%s  gia_nan_policy='nodata': written as nodata=%r, NOT as 0 m "
+                    "of correction.", detail, nodata_val,
+                )
+
+            # ICE-7G thickness has no legitimate unknown, and the sidecar declares
+            # nodata=0.0 — so a NaN slipping through would be written as *ice-free*
+            # and would drop ice instead of flagging it.  Refuse outright.
+            n_ice_unknown = int(np.count_nonzero(~np.isfinite(ice_h_tile)))
+            if n_ice_unknown:
+                raise ValueError(
+                    f"epoch {epoch_ka} ka, tile {tile_id}: ICE-7G thickness is "
+                    f"non-finite over {n_ice_unknown} of {ice_h_tile.size} cells.  "
+                    "Thickness has no 'unknown' state in this pipeline: the "
+                    "sidecar's nodata is 0.0, so clipping/zeroing these cells "
+                    "would record them as ICE-FREE and silently remove ice.  Fix "
+                    "the ICE-7G source or extent instead."
+                )
+
+            # Everything downstream of here treats "unknown modern elevation" and
+            # "unknown GIA correction" identically: both are nodata, neither is 0.
+            unknown_mask = nodata_mask | gia_unknown
+
             modern_dem = win.data.astype(np.float32)
             modern_dem = np.where(nodata_mask, np.nan, modern_dem)
 
             paleo_bedrock = (modern_dem + dz_tile).astype(np.float32)
-            paleo_bedrock = np.where(nodata_mask, np.nan, paleo_bedrock)
+            paleo_bedrock = np.where(unknown_mask, np.nan, paleo_bedrock)
 
             ice_h_tile = np.clip(ice_h_tile, 0.0, None).astype(np.float32)
             ice_h_tile = np.where(nodata_mask, 0.0, ice_h_tile)
@@ -316,13 +460,34 @@ def run_single_tile_epochs(
                 paleo_surface = paleo_bedrock.copy()
                 paleo_surface[ice_mask] = paleo_bedrock[ice_mask] + ice_h_tile[ice_mask]
 
-            paleo_surface = np.where(nodata_mask, nodata_val, paleo_surface).astype(np.float32)
+            paleo_surface = np.where(unknown_mask, nodata_val, paleo_surface).astype(np.float32)
+
+            # Belt and braces: nothing non-finite may leave this function inside a
+            # raster whose header declares a finite nodata.  A residual NaN would
+            # be read back as a valid float by any consumer using masked=False.
+            residual = ~np.isfinite(paleo_surface)
+            if residual.any():
+                paleo_surface = np.where(residual, nodata_val, paleo_surface).astype(np.float32)
+                logger.warning(
+                    "epoch %s ka, tile %s: %d non-finite cells survived the "
+                    "surface composition and were written as nodata=%r",
+                    epoch_ka, tile_id, int(np.count_nonzero(residual)), nodata_val,
+                )
 
             # ── Write ice sidecar and paleo tile ─────────────────────────────
             ice_profile = tile_profile.copy()
             ice_profile["nodata"] = 0.0
             _write_single_band_geotiff(ice_path, ice_h_tile, ice_profile)
             _write_single_band_geotiff(paleo_path, paleo_surface, tile_profile)
+
+            # Range over the KNOWN cells.  A plain min()/max() returns NaN for the
+            # whole matrix as soon as one ice-surface hole exists, which destroys
+            # the diagnostic; the count of unknown cells is carried separately by
+            # ``gia_unknown_mask`` rather than being smuggled into the range.
+            if np.isfinite(gia_matrix).any():
+                dz_min, dz_max = float(np.nanmin(gia_matrix)), float(np.nanmax(gia_matrix))
+            else:
+                dz_min = dz_max = float("nan")
 
             results[float(epoch_ka)] = EpochResult(
                 epoch_ka=float(epoch_ka),
@@ -331,8 +496,9 @@ def run_single_tile_epochs(
                 ice_mask=ice_mask,
                 ice_h_tile=ice_h_tile,
                 paleo_bedrock=paleo_bedrock,
-                dz_min=float(np.min(gia_matrix)),
-                dz_max=float(np.max(gia_matrix)),
+                dz_min=dz_min,
+                dz_max=dz_max,
+                gia_unknown_mask=gia_unknown,
             )
 
             if verbose:

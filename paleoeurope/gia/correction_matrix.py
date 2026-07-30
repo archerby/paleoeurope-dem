@@ -17,6 +17,16 @@ The matrix workflow mirrors production SYNC mode exactly:
    in-memory correction matrix using ``rasterio`` bilinear resampling,
    identical to the path taken when reading from a GeoTIFF on disk.
 
+Unknown values
+--------------
+NaN in a correction matrix means **unknown**, and this module never converts it
+into a number.  A Δz_GIA of ``0.0`` is a legitimate measurement — the far-field
+tropical reference set sits there by construction of the datum — so a zero-fill
+is not a neutral placeholder, it is a false measurement, and it lands on exactly
+the formerly glaciated ground where the isostatic signal is largest.  The NaN
+originates in :func:`paleoeurope.gia.ice6g_topo.solid_displacement`, which refuses
+to report a solid-surface displacement where ICE-6G ``Topo`` is the ice surface.
+
 Naming
 ------
 Throughout this module the term *correction_matrix* (abbreviated CM) replaces
@@ -44,9 +54,27 @@ from rasterio.io import MemoryFile
 from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage import gaussian_filter
 
-__all__ = ["build_correction_matrix", "read_correction_matrix", "write_correction_matrix"]
+__all__ = [
+    "build_correction_matrix",
+    "read_correction_matrix",
+    "write_correction_matrix",
+    "CorrectionMatrixHasUnknownCellsError",
+]
 
 logger = logging.getLogger(__name__)
+
+
+class CorrectionMatrixHasUnknownCellsError(ValueError):
+    """A caller asked for a NaN-free correction matrix and the matrix has NaN.
+
+    Raised by :func:`read_correction_matrix` when ``preserve_nan=False``.  The
+    NaN is not a nodata artefact: :func:`paleoeurope.gia.ice6g_topo.solid_displacement`
+    emits it over cells where ICE-6G ``Topo`` is the **ice surface**, i.e. where
+    these files carry no solid-surface elevation at all.  Zero-filling it would
+    record 0 m of isostatic correction — *"nothing happened here"* — over exactly
+    the formerly glaciated ground where the isostatic signal is largest.  So the
+    opt-out is a refusal, not a fill.
+    """
 
 # Production default: 10 arcsec ≈ 1/360°  (~300 m @ 60°N).
 # Notebooks may override to 1/60 (1 arcmin ≈ 1.8 km) for quick single-tile
@@ -60,11 +88,27 @@ def write_correction_matrix(
     output_path: str,
     *,
     compress: str = "lzw",
+    nodata: float = float("nan"),
 ) -> None:
     """Write a correction matrix to a GeoTIFF.
 
     This mirrors production's on-disk DMK workflow (Stage 0 in geo_07):
     build a global matrix once per epoch, then window-read slices per tile.
+
+    Parameters
+    ----------
+    nodata : float, optional
+        Nodata value declared in the GeoTIFF header.  Default ``nan``.
+
+        It used to be ``0.0``, which conflated the two things this module now
+        keeps apart: for a Δz_GIA matrix ``0.0`` is a perfectly ordinary
+        *measured* value (far-field tropical land sits there by construction of
+        the datum), so declaring it nodata told every masked reader to throw away
+        the cells where the answer is "no rebound" and to keep the NaN cells where
+        the answer is "unknown".  ``nan`` marks exactly the unknown cells — the
+        ice-surface holes from
+        :func:`paleoeurope.gia.ice6g_topo.solid_displacement` — and nothing else.
+        Pass ``0.0`` explicitly only to reproduce a pre-2026-07-30 artefact.
     """
     profile = {
         "driver": "GTiff",
@@ -78,7 +122,7 @@ def write_correction_matrix(
         "tiled": True,
         "blockxsize": 256,
         "blockysize": 256,
-        "nodata": 0.0,
+        "nodata": nodata,
     }
 
     import os
@@ -107,6 +151,7 @@ def build_correction_matrix(
     res_deg: float = CM_RESOLUTION_DEG,
     gaussian_sigma: Optional[float] = None,
     interp_method: str = "linear",
+    oob_fill: float = 0.0,
 ) -> tuple[np.ndarray, "rasterio.transform.Affine"]:
     """Interpolate a coarse model field to a uniform output grid.
 
@@ -144,6 +189,15 @@ def build_correction_matrix(
         If given, a Gaussian filter of this width (in output *pixels*) is
         applied after interpolation.  Pass e.g. ``1.5`` for H_ice smoothing.
         Values below zero are clipped to zero after smoothing.
+    oob_fill : float, optional
+        Value written where the output grid falls outside the model grid's
+        extent.  Default ``0.0`` for backwards compatibility, but note that this
+        is the same "unknown looks like no correction" conflation the rest of this
+        module now refuses: 0 m of Δz_GIA is a legitimate measured value.  The
+        production caller pads the model subset by 1° beyond the output bbox so
+        the case never arises; whenever it *does* arise a WARNING is logged with
+        the cell count, so it can no longer happen silently.  Pass
+        ``float("nan")`` to make it explicit instead.
 
     Returns
     -------
@@ -195,11 +249,34 @@ def build_correction_matrix(
         field_2d.astype(np.float64),
         method=effective_method,
         bounds_error=False,
-        fill_value=0.0,
+        fill_value=oob_fill,
     )
     matrix_arr = interp(pts).reshape(n_rows, n_cols).astype(np.float32)
 
     del lon_g, lat_g, pts, interp
+
+    # Out-of-extent cells get *filled*, not measured.  Never let that be silent:
+    # with the default oob_fill=0.0 those cells are indistinguishable from
+    # "measured zero rebound".  Counted from the 1-D coordinate vectors, so this
+    # costs nothing.
+    n_in_rows = int(np.count_nonzero(
+        (out_lats >= field_lats[0]) & (out_lats <= field_lats[-1])
+    ))
+    n_in_cols = int(np.count_nonzero(
+        (out_lons >= field_lons[0]) & (out_lons <= field_lons[-1])
+    ))
+    n_oob = n_rows * n_cols - n_in_rows * n_in_cols
+    if n_oob:
+        logger.warning(
+            "build_correction_matrix: %d of %d output cells (%.1f%%) fall outside "
+            "the model grid extent [%.3f, %.3f]x[%.3f, %.3f] and were FILLED with "
+            "%r — these carry no measurement.  Widen the model subset (production "
+            "pads by 1°) or pass oob_fill=float('nan').",
+            n_oob, n_rows * n_cols, 100.0 * n_oob / (n_rows * n_cols),
+            float(field_lats[0]), float(field_lats[-1]),
+            float(field_lons[0]), float(field_lons[-1]),
+            oob_fill,
+        )
 
     if gaussian_sigma is not None and gaussian_sigma > 0:
         matrix_arr = gaussian_filter(matrix_arr.astype(np.float64),
@@ -210,12 +287,23 @@ def build_correction_matrix(
         west, south, east, north, n_cols, n_rows
     )
 
+    # Range over the *finite* cells: a plain .min()/.max() reports NaN for the
+    # whole matrix as soon as one ice-surface hole is present, which hides the
+    # very information this line exists to show.
+    n_unknown = int(np.count_nonzero(~np.isfinite(matrix_arr)))
+    if n_unknown < matrix_arr.size:
+        lo = float(np.nanmin(matrix_arr))
+        hi = float(np.nanmax(matrix_arr))
+    else:
+        lo = hi = float("nan")
     logger.debug(
-        "build_correction_matrix: shape=%s  res=%.6f°  range=[%.2f, %.2f]",
+        "build_correction_matrix: shape=%s  res=%.6f°  finite range=[%.2f, %.2f]  "
+        "unknown(NaN)=%d",
         matrix_arr.shape,
         res_deg,
-        float(matrix_arr.min()),
-        float(matrix_arr.max()),
+        lo,
+        hi,
+        n_unknown,
     )
 
     return matrix_arr, matrix_transform
@@ -228,6 +316,7 @@ def read_correction_matrix(
     h: int,
     w: int,
     resampling: rasterio.enums.Resampling = rasterio.enums.Resampling.bilinear,
+    preserve_nan: bool = True,
 ) -> np.ndarray:
     """Window-read a tile-sized slice of an in-memory correction matrix.
 
@@ -238,6 +327,24 @@ def read_correction_matrix(
     Pass ``resampling=rasterio.enums.Resampling.cubic`` when reading ICE
     thickness to eliminate the linear-ramp artefact caused by low-resolution
     (1°) ICE-7G grids being bilinearly stretched.
+
+    NaN policy
+    ----------
+    **NaN is data and is passed through.**  Until 2026-07-30 this function ended
+    with ``np.nan_to_num(result, nan=0.0, copy=False)``, which quietly defeated the
+    ice-surface guard one hop upstream:
+    :func:`paleoeurope.gia.ice6g_topo.solid_displacement` returns NaN where ICE-6G
+    ``Topo`` is the **ice surface** and the files therefore hold no solid-surface
+    elevation at all, and this call turned every such cell into ``0.0`` — a
+    confident *"no isostatic correction here"* over precisely the formerly
+    glaciated ground where the correction is largest (median +1141 m of
+    ice-surface offset at 21 ka).  Measured on a 60x60 N62E006 tile with a single
+    glaciated model node, 900 of 3600 cells (25 %) arrived as exactly 0.0.
+
+    NaN in the result therefore means **unknown**, never "zero".  Consumers must
+    either restrict themselves to the finite cells or source Δz from ICE-7G's
+    bedrock-deformation field; :func:`paleoeurope.gia.correction_pipeline.run_single_tile_epochs`
+    does the former and refuses to write an unknown cell as a number.
 
     Parameters
     ----------
@@ -253,12 +360,27 @@ def read_correction_matrix(
     resampling : rasterio.enums.Resampling, optional
         Rasterio resampling algorithm.  Default ``bilinear`` (for GIA).
         Use ``cubic`` for ice-thickness matrices.
+    preserve_nan : bool, optional
+        Default ``True`` — the honest behaviour: unknown cells stay NaN.
+
+        ``False`` is **not** a zero-fill.  It is an assertion by the caller that
+        this matrix has no unknown cells; if any are present the call raises
+        :class:`CorrectionMatrixHasUnknownCellsError` naming the count, because
+        the only two ways to "remove" a NaN here are to refuse it or to lie about
+        it.  On a NaN-free matrix both modes return the identical array, so
+        existing NaN-free callers are unaffected either way.
 
     Returns
     -------
     np.ndarray, dtype float32, shape (h, w)
-        A resampled slice of the correction matrix, NaN-free
-        (NaN values are replaced by 0.0).
+        A resampled slice of the correction matrix.  **May contain NaN**, meaning
+        *unknown* (ice surface, no bedrock in the source files) — see the NaN
+        policy above.
+
+    Raises
+    ------
+    CorrectionMatrixHasUnknownCellsError
+        If ``preserve_nan=False`` and the resampled slice contains NaN.
 
     Examples
     --------
@@ -300,5 +422,23 @@ def read_correction_matrix(
                 masked=False,
             ).astype(np.float32)
 
-    np.nan_to_num(result, nan=0.0, copy=False)
+    n_unknown = int(np.count_nonzero(~np.isfinite(result)))
+    if n_unknown and not preserve_nan:
+        raise CorrectionMatrixHasUnknownCellsError(
+            f"read_correction_matrix: {n_unknown} of {result.size} cells "
+            f"({100.0 * n_unknown / result.size:.1f}%) of this tile are unknown "
+            "(NaN) because ICE-6G 'Topo' is the ICE SURFACE there and these files "
+            "carry no bedrock-under-ice field.  preserve_nan=False asserts a "
+            "NaN-free matrix and is refused rather than honoured by zero-filling: "
+            "0.0 is a legitimate measured Δz_GIA, so a fill here would record 'no "
+            "isostatic correction' over formerly glaciated ground.  Either keep "
+            "preserve_nan=True and skip the unknown cells, or take Δz from "
+            "ICE-7G's bedrock-deformation field."
+        )
+    if n_unknown:
+        logger.info(
+            "read_correction_matrix: %d of %d tile cells (%.1f%%) are unknown "
+            "(ice-surface NaN) and are returned as NaN, not 0.0",
+            n_unknown, result.size, 100.0 * n_unknown / result.size,
+        )
     return result

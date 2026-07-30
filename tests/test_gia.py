@@ -137,32 +137,40 @@ class TestIce6gLoader:
         with pytest.raises(FileNotFoundError):
             Ice6gLoader(tmp_path / "nonexistent.nc")
 
-    def test_get_fields_fixture(self, ice6g_path):
-        """get_fields should return arrays with correct shapes from fixture data."""
+    def test_regional_fixture_cannot_define_the_global_datum(self, ice6g_path):
+        """A regional ICE-6G cut must be REFUSED, not silently improvised on.
+
+        Rewritten 2026-07-30.  This test used to assert ``|Δz|.max() > 0`` for
+        Norway at 21 ka off ``ICE6G_fixture.nc`` — a 66×67 cut spanning
+        57–68 N / 1–12 E.  That assertion passed under the retired estimator
+        only because it took its datum from whatever deep cells happened to be
+        inside the window: a *regional* deep-ocean median, ice-proximal and
+        therefore biased, which is precisely the defect that put a ~−30 m
+        spurious lowering into every baked BlackSea raster.
+
+        The sea-surface datum is a **global far-field** quantity.  A window with
+        no ice-free tropical continental land cannot define it, and the honest
+        behaviour is to say so rather than to return a plausible-looking number.
+        So the invariant worth pinning here is the refusal itself — the physics
+        is exercised on global synthetic grids by
+        :class:`TestIce6gLoaderDeltaIsSolidDisplacement` and on the real files by
+        :class:`TestIce6gLoaderRealData`.
+        """
         from paleoeurope.gia.ice6g_loader import Ice6gLoader
 
         if not ice6g_path.exists():
             pytest.skip("ICE-6G fixture file not found")
 
         loader = Ice6gLoader(ice6g_path)
-        lats, lons, dz, ice_h = loader.get_fields(
-            epoch_ka=21,
-            bounds=(4.0, 59.0, 10.0, 65.0),   # Norway — inside fixture coverage
-        )
-        assert dz.ndim == 2
-        assert ice_h.ndim == 2
-        assert dz.shape == ice_h.shape
-        assert len(lats) == dz.shape[0]
-        assert len(lons) == dz.shape[1]
-        # Real GIA signal: Norway at 21 ka has significant bedrock depression.
-        # The delta is Δz_solid = ΔTopo − deep-ocean-median ΔTopo (see
-        # paleoeurope.gia.ice6g_topo), NOT the bare ΔTopo that the retired
-        # 'stgr' path returned — that one double-counted the ~112 m eustatic
-        # sea-surface change baked into Topo.
-        assert np.abs(dz).max() > 0.0, (
-            "GIA delta (Δz_solid) must be non-zero for Norway at 21 ka; "
-            "check that ICE6G_fixture.nc was generated from real data via "
-            "prepare_test_fixtures.py and that ice6g_loader reads 'Topo'."
+        with pytest.raises(ValueError) as exc:
+            loader.get_fields(
+                epoch_ka=21,
+                bounds=(4.0, 59.0, 10.0, 65.0),   # Norway — inside fixture coverage
+            )
+        msg = str(exc.value)
+        assert "reference set" in msg or "global" in msg, (
+            "a regional cut must be refused with a message that names the "
+            f"reason (reference set / global datum); got: {msg}"
         )
 
 
@@ -203,6 +211,37 @@ REGION_DZ_SOLID = -30.0      # true solid displacement over the test region
 REGION_TOPO_0 = -50.0        # region is shallow water today → ``Orog`` == 0 there
 DEEP_TOPO_0 = -3000.0        # far-field deep ocean
 
+# --- Far-field reference set -------------------------------------------------
+#
+# The sea-surface datum is the median ΔTopo over ice-free tropical CONTINENTAL
+# land (|lat| <= 25, topo_0 > 0, never glaciated, far from ice).  Every builder
+# below must therefore carry some, or ``implied_sea_surface_offset`` correctly
+# refuses to invent a datum.  These fixtures originally held no land above sea
+# level anywhere — topo_0 was −3000 m ocean plus a −50 m shelf — so the
+# reference set came out empty.
+#
+# The band is placed at |lat| <= 20 (strictly inside the 25° selector, so no
+# cell is marginal), across lon 0–120°E, and given zero solid displacement:
+# the datum measured over it is exactly SEA_SURFACE_OFFSET, which is what the
+# assertions downstream expect.  It cannot collide with the Manych test region
+# (lat 35–55) or the synthetic ice cap (lat > 60).
+TROPICS_LAT_ABS = 20.0
+TROPICS_LON_MAX = 120.0
+TROPICS_TOPO_0 = 200.0       # continental interior, well above sea level
+
+
+def _add_tropical_reference_land(
+    topo_0: np.ndarray, dz_solid: np.ndarray, lat2d: np.ndarray, lon2d: np.ndarray
+) -> None:
+    """Stamp the far-field reference band into *topo_0* / *dz_solid* in place."""
+    band = (
+        (np.abs(lat2d) <= TROPICS_LAT_ABS)
+        & (lon2d >= 0.0)
+        & (lon2d <= TROPICS_LON_MAX)
+    )
+    topo_0[band] = TROPICS_TOPO_0
+    dz_solid[band] = 0.0
+
 
 def _make_ice6g_like_nc(
     path: Path,
@@ -235,6 +274,7 @@ def _make_ice6g_like_nc(
 
     dz_solid = np.zeros_like(topo_0)
     dz_solid[region] = REGION_DZ_SOLID
+    _add_tropical_reference_land(topo_0, dz_solid, lat2d, lon2d)
 
     topo_t = topo_0 + SEA_SURFACE_OFFSET + dz_solid
 
@@ -298,6 +338,7 @@ def _make_ice6g_like_nc_stepped(path: Path) -> Path:
     dz_solid = np.zeros_like(topo_0)
     dz_solid[region & (lon2d < STEP_EDGE_LON)] = STEP_DZ_WEST
     dz_solid[region & (lon2d >= STEP_EDGE_LON)] = STEP_DZ_EAST
+    _add_tropical_reference_land(topo_0, dz_solid, lat2d, lon2d)
 
     topo_t = topo_0 + SEA_SURFACE_OFFSET + dz_solid
     topo = np.stack([topo_0, topo_t]).astype(np.float32)
@@ -336,7 +377,10 @@ class TestIce6gLoaderSmoothing:
             topo_t = ds["Topo"].isel(time=1).values.astype(np.float64)
             lat = ds["lat"].values
             lon = ds["lon"].values
-        offset = implied_sea_surface_offset(topo_t, topo_0)
+        # Pass the real latitudes: these fixtures are global in coverage but not
+        # cell-centred at a resolution the shape heuristic recognises, and the
+        # production loader passes ``lat=`` for exactly the same reason.
+        offset = implied_sea_surface_offset(topo_t, topo_0, lat=lat)
         dz_global = solid_displacement(topo_t, topo_0, offset)
         return dz_global[np.ix_(np.isin(lat, lats_sub), np.isin(lon, lons_sub))]
 
@@ -446,10 +490,10 @@ class TestIce6gLoaderDeltaIsSolidDisplacement:
         with xr.open_dataset(nc) as ds:
             topo_0 = ds["Topo"].isel(time=0).values.astype(np.float64)
             topo_t = ds["Topo"].isel(time=1).values.astype(np.float64)
-            offset = implied_sea_surface_offset(topo_t, topo_0)
-            dz_ref_global = solid_displacement(topo_t, topo_0, offset)
             lat = ds["lat"].values
             lon = ds["lon"].values
+            offset = implied_sea_surface_offset(topo_t, topo_0, lat=lat)
+            dz_ref_global = solid_displacement(topo_t, topo_0, offset)
 
         assert offset == pytest.approx(SEA_SURFACE_OFFSET, abs=1e-3)
 
@@ -690,11 +734,23 @@ class TestIce6gLoaderRealData:
         ds.close()
         return dest
 
-    def test_manych_corridor_subsides_at_16_5_ka(self, tmp_path):
-        """Measured on the real grid: Δz_solid ≈ −26 m, ΔOrog ≈ +81 m.
+    def test_manych_corridor_rises_slightly_at_16_5_ka(self, tmp_path):
+        """Measured on the real grid: Δz_solid ≈ +2.7 m at the sill cell.
 
-        A positive Δz there lifts the +23 m Manych sill out of reach and the
-        Khvalynian spill west becomes impossible at any Caspian level.
+        Rewritten 2026-07-30 — this test used to assert Δz_solid < 0 ("must be
+        negative, measured −26.5 m").  That −26.5 m was the **bug**: the retired
+        estimator referenced its datum to the deep-ocean median, and the
+        far-field ocean floor stands ~+29 m higher at 16.5 ka because the water
+        load is absent, so the estimator zeroed a real signal and pushed it onto
+        the continents sign-flipped.  Referenced instead to ice-free tropical
+        continental land, the Manych corridor shows a small *uplift*.
+
+        Direction matters, and it is counter-intuitive: the bug placed the
+        palaeo-sill at ≈ −3.5 m a.s.l., i.e. ~26 m LOWER than today, which made
+        the Khvalynian spill spuriously trivial.  The corrected sill stands at
+        ≈ +25.7 m — higher than the modern +23.00 m — so the fix makes the spill
+        HARDER to achieve, not easier.  Anything that drags this number back
+        towards −26 m has reintroduced the deep-ocean datum.
         """
         from paleoeurope.gia.ice6g_loader import Ice6gLoader
 
@@ -712,11 +768,25 @@ class TestIce6gLoaderRealData:
             xr.DataArray(dz, coords={"lat": lats, "lon": lons}, dims=("lat", "lon"))
             .sel(lat=MANYCH_LAT, lon=MANYCH_LON, method="nearest")
         )
-        assert sill < 0.0, (
-            f"Manych Δz_solid at 16.5 ka must be negative (measured −26.5 m); "
-            f"got {sill:+.2f} m — that is the ΔOrog sign (+81 m) leaking through"
+        assert sill > 0.0, (
+            f"Manych Δz_solid at 16.5 ka must be a small POSITIVE uplift "
+            f"(measured +2.7 m at the sill cell); got {sill:+.2f} m. A negative "
+            "value near −26 m means the deep-ocean datum is back."
         )
-        assert -60.0 < sill < -5.0, f"Manych Δz_solid {sill:+.2f} m out of range"
+        assert 0.5 < sill < 8.0, (
+            f"Manych Δz_solid {sill:+.2f} m out of range — expected a few metres "
+            "of uplift; ±1–2 m of near-field systematic is accepted"
+        )
+        # The number that actually gates the animation: the palaeo-sill must sit
+        # ABOVE the modern +23.00 m, so overtopping it requires a real highstand.
+        palaeo_sill = 23.00 + sill
+        assert palaeo_sill > 23.00, (
+            f"palaeo-sill {palaeo_sill:.2f} m must exceed the modern +23.00 m"
+        )
+        assert 24.0 < palaeo_sill < 30.0, (
+            f"palaeo-sill {palaeo_sill:.2f} m a.s.l. outside the corrected "
+            "+25.7…+26.9 m band (±1–2 m near-field systematic)"
+        )
 
 
 # ==========================================================================
