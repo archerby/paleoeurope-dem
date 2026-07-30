@@ -1,17 +1,26 @@
 # tests/test_bake_black_sea.py
 """Unit tests for bake_black_sea helpers (no data files required)."""
+import hashlib
 import importlib
 import inspect
+import logging
 import subprocess
 import sys
 import textwrap
+import warnings
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # repo root for `scripts`
 import scripts.bake_black_sea as b
+from paleoeurope.gia.ice6g_topo import (
+    SMOOTHING_RIM_CELLS,
+    IceSurfaceUnmaskedWarning,
+    minimum_reference_cells,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -633,3 +642,520 @@ def test_paleo_data_root_env_redirects_inputs(monkeypatch, tmp_path):
     finally:
         monkeypatch.delenv("PALEO_DATA_ROOT")
         importlib.reload(b)
+
+
+# ===========================================================================
+# TRACK B — the ice-surface guard must reach the code path that actually bakes
+#
+# ``gia_delta_subset`` is the ONLY place in this project that runs GIA on the
+# real ICE-6G distribution.  It called ``solid_displacement`` with no ``sftgif``,
+# so every raster the Black-Sea bake produces was built with the ice-surface
+# guard switched off.  Numerically harmless for THIS bbox (the window is ice-free
+# at every shipped epoch, proved below) and therefore exactly the kind of latent
+# defect that only bites once someone points the bbox somewhere colder.
+# ===========================================================================
+
+
+# --- synthetic global ICE-6G fixtures ---------------------------------------
+#
+# 1-degree global grid: n_lon == 2*n_lat and n_lat >= 90, which is what
+# ``global_latitude_grid`` accepts, so the datum can be derived from it exactly
+# as it is from the real 1080x2160 files.  Longitudes run 0..360 like the real
+# distribution.  Tropical continental land (|lat| <= 20, lon <= 60, topo_0 > 0)
+# supplies the far-field reference set; the Black-Sea window is deliberately
+# OUTSIDE the +/-25 deg band so it can never leak into the datum.
+
+#: 0.5-degree global grid.  n_lon == 2*n_lat and n_lat >= 90 is what
+#: ``global_latitude_grid`` accepts.  Half a degree rather than one because
+#: ``SMOOTHING_RIM_CELLS`` = 8 is calibrated in CELLS on the 10-arcmin
+#: distribution (~150 km); on a 1-degree grid the same 8 cells would be 8 degrees
+#: and would swallow the whole 10-degree-tall window.
+_FAKE_N_LAT, _FAKE_N_LON = 360, 720
+#: Δz the fixture plants inside the Black-Sea window, in metres.
+_FAKE_LOCAL_DZ_M = 7.0
+#: Ice-surface height the fixture plants over its glaciated cells.  Stands in for
+#: the +1711 m Fennoscandian / +2736 m Hudson readings the real files give.
+_FAKE_ICE_SURFACE_M = 2000.0
+
+
+def _fake_ice6g_arrays(*, offset_m, local_dz_m, ice_in_window, ice_lat_min=None):
+    """Synthetic global ICE-6G fields.
+
+    *ice_in_window* glaciates the whole Black-Sea window; *ice_lat_min* glaciates
+    only the part of it at or above that latitude, so a fixture can straddle a
+    palaeo-ice margin.
+    """
+    lat = -90.0 + (np.arange(_FAKE_N_LAT) + 0.5) * (180.0 / _FAKE_N_LAT)
+    lon = (np.arange(_FAKE_N_LON) + 0.5) * (360.0 / _FAKE_N_LON)
+    lat2d, lon2d = np.meshgrid(lat, lon, indexing="ij")
+
+    tropical_land = (np.abs(lat2d) <= 20.0) & (lon2d <= 60.0)
+    in_window = (
+        (lat2d >= b.LAT_MIN - b.BUF)
+        & (lat2d <= b.LAT_MAX + b.BUF)
+        & (lon2d >= b.LON_MIN - b.BUF)
+        & (lon2d <= b.LON_MAX + b.BUF)
+    )
+    topo_0 = np.where(tropical_land, 500.0, -3000.0)
+    topo_0 = np.where(in_window, 100.0, topo_0)
+
+    if ice_lat_min is not None:
+        ice = in_window & (lat2d >= float(ice_lat_min))
+    else:
+        ice = in_window & bool(ice_in_window)
+    topo_t = topo_0 + offset_m + np.where(in_window, local_dz_m, 0.0)
+    # Over ice, ICE-6G ``Topo`` is the ICE SURFACE, not bedrock — the whole point.
+    topo_t = np.where(ice, topo_0 + offset_m + _FAKE_ICE_SURFACE_M, topo_t)
+
+    sftlf = np.where(topo_0 > 0.0, 100.0, 0.0)
+    sftgif = np.where(ice, 100.0, 0.0)
+    return lat, lon, topo_0, topo_t, sftlf, sftgif
+
+
+def _write_fake_ice6g(
+    directory,
+    epoch,
+    *,
+    offset_m,
+    local_dz_m=_FAKE_LOCAL_DZ_M,
+    ice_in_window=False,
+    ice_lat_min=None,
+    with_sftgif=True,
+):
+    xr = pytest.importorskip("xarray")
+    lat, lon, topo_0, topo_t, sftlf, sftgif = _fake_ice6g_arrays(
+        offset_m=offset_m,
+        local_dz_m=local_dz_m,
+        ice_in_window=ice_in_window,
+        ice_lat_min=ice_lat_min,
+    )
+    data = {
+        "sftlf": (("lat", "lon"), sftlf.astype("f4")),
+        "Topo": (("lat", "lon"), topo_t.astype("f4")),
+        "Orog": (("lat", "lon"), np.maximum(topo_t, 0.0).astype("f4")),
+    }
+    if with_sftgif:
+        data["sftgif"] = (("lat", "lon"), sftgif.astype("f4"))
+    ds = xr.Dataset(data, coords={"lat": lat, "lon": lon})
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / b._epoch_filename(epoch)
+    ds.to_netcdf(path)
+    return path
+
+
+def _fake_ice6g_dir(tmp_path, monkeypatch, *, epoch, offset_m=80.0, **kwargs):
+    """Two-file synthetic ICE-6G directory (epoch + 0 ka), wired into the module."""
+    directory = tmp_path / "ICE6G"
+    _write_fake_ice6g(directory, epoch, offset_m=offset_m, **kwargs)
+    _write_fake_ice6g(directory, 0, offset_m=0.0, local_dz_m=0.0, ice_in_window=False,
+                      with_sftgif=kwargs.get("with_sftgif", True))
+    monkeypatch.setattr(b, "ICE6G_DIR", directory)
+    return directory
+
+
+def _fake_dem(tmp_path, *, lat_lo=42.0, lat_hi=45.0, lon_lo=30.0, lon_hi=35.0, n=24):
+    """Small modern-DEM GeoTIFF wholly inside the BS model window."""
+    rasterio = pytest.importorskip("rasterio")
+    from rasterio.transform import from_bounds
+
+    path = tmp_path / "fake_bs_dem.tif"
+    dem = np.full((n, n), -50.0, dtype=np.float32)
+    profile = {
+        "driver": "GTiff",
+        "height": n,
+        "width": n,
+        "count": 1,
+        "dtype": "float32",
+        "crs": "EPSG:4326",
+        "transform": from_bounds(lon_lo, lat_lo, lon_hi, lat_hi, n, n),
+        "nodata": -9999.0,
+    }
+    with rasterio.open(path, "w", **profile) as dst:
+        dst.write(dem, 1)
+    return path
+
+
+def test_fake_ice6g_fixture_supplies_a_usable_far_field_reference_set():
+    """Guard the guard: if the fixture had no tropical land the datum would raise."""
+    _, _, topo_0, _, _, _ = _fake_ice6g_arrays(
+        offset_m=80.0, local_dz_m=_FAKE_LOCAL_DZ_M, ice_in_window=False
+    )
+    from paleoeurope.gia.ice6g_topo import far_field_reference_mask
+
+    ref = far_field_reference_mask(topo_0)
+    assert int(ref.sum()) > minimum_reference_cells(topo_0.size)
+
+
+# --- requirement 1: the ice information must actually be passed through -------
+
+
+def _real_ice6g_or_skip(epoch=16.5):
+    for ep in (epoch, 0):
+        path = b.ICE6G_DIR / b._epoch_filename(ep)
+        if not path.exists():
+            pytest.skip(f"real ICE-6G file not available at {path}")
+    return b.ICE6G_DIR
+
+
+def test_gia_delta_subset_does_not_warn_about_unmasked_ice_surface():
+    """THE DEFECT.  The only real-data GIA call in the project ran unguarded."""
+    _real_ice6g_or_skip(16.5)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", IceSurfaceUnmaskedWarning)
+        b.gia_delta_subset(16.5)
+
+
+def test_gia_delta_subset_hands_solid_displacement_the_ice_fields(tmp_path, monkeypatch):
+    """``sftgif`` for BOTH endpoints reaches ``solid_displacement``."""
+    _fake_ice6g_dir(tmp_path, monkeypatch, epoch=16.5, ice_in_window=True)
+    seen = {}
+    real = b.solid_displacement
+
+    def spy(topo_t, topo_0, offset, **kwargs):
+        seen.update(kwargs)
+        seen["dz_shape"] = np.asarray(topo_t).shape
+        return real(topo_t, topo_0, offset, **kwargs)
+
+    monkeypatch.setattr(b, "solid_displacement", spy)
+    b.gia_delta_subset(16.5)
+    assert seen.get("sftgif_t") is not None, "sftgif at epoch t was not passed"
+    assert seen.get("sftgif_0") is not None, "sftgif at 0 ka was not passed"
+    assert np.asarray(seen["sftgif_t"]).shape == seen["dz_shape"]
+    assert np.asarray(seen["sftgif_0"]).shape == seen["dz_shape"]
+
+
+def test_glaciated_window_comes_back_as_nan_not_as_an_ice_surface(tmp_path, monkeypatch):
+    """A glaciated cell must be NaN, never the +2000 m ice surface."""
+    _fake_ice6g_dir(tmp_path, monkeypatch, epoch=16.5, ice_in_window=True)
+    dz, _, _ = b.gia_delta_subset(16.5)
+    assert not np.isfinite(dz).any(), "glaciated window must be entirely unknown"
+    assert not (np.nan_to_num(dz, nan=0.0) > 1000.0).any()
+
+
+def test_ice_free_window_is_unaffected_by_the_guard(tmp_path, monkeypatch):
+    """The same fixture with no ice returns the planted Δz exactly, no NaN."""
+    _fake_ice6g_dir(tmp_path, monkeypatch, epoch=16.5, ice_in_window=False)
+    dz, _, _ = b.gia_delta_subset(16.5)
+    assert np.isfinite(dz).all()
+    assert dz == pytest.approx(_FAKE_LOCAL_DZ_M, abs=1e-3)
+
+
+def test_missing_ice_information_is_refused_rather_than_silently_warned(
+    tmp_path, monkeypatch
+):
+    """A file with no ``sftgif`` means the guard is UNKNOWABLE — refuse.
+
+    The retired behaviour was a ``UserWarning`` nobody read, on every epoch of
+    every run.  Rule: never let an unknown pass as a number.  The opt-out has to
+    be written down in code.
+    """
+    _fake_ice6g_dir(tmp_path, monkeypatch, epoch=16.5, with_sftgif=False)
+    with pytest.raises(ValueError, match="(?i)sftgif|ice"):
+        b.gia_delta_subset(16.5)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", IceSurfaceUnmaskedWarning)
+        dz, _, _ = b.gia_delta_subset(16.5, require_ice_information=False)
+    assert np.isfinite(dz).all()
+
+
+def test_ice_information_requirement_is_on_by_default():
+    sig = inspect.signature(b.gia_delta_subset)
+    assert sig.parameters["require_ice_information"].default is True
+
+
+# --- requirement 2: the datum is GLOBAL, the displacement is LOCAL -----------
+
+
+def test_datum_is_taken_from_the_global_field_and_displacement_from_the_subset(
+    tmp_path, monkeypatch
+):
+    """Pinned because getting this backwards IS the retired deep-ocean bug.
+
+    ``implied_sea_surface_offset`` must see the whole 180x360 grid; the regional
+    10x17 cut must only ever reach ``solid_displacement``.
+    """
+    _fake_ice6g_dir(tmp_path, monkeypatch, epoch=16.5)
+    shapes = {}
+    real_offset, real_disp = b.implied_sea_surface_offset, b.solid_displacement
+
+    def spy_offset(topo_t, topo_0, *a, **kw):
+        shapes["offset"] = (np.asarray(topo_t).shape, np.asarray(topo_0).shape)
+        return real_offset(topo_t, topo_0, *a, **kw)
+
+    def spy_disp(topo_t, topo_0, offset, **kw):
+        shapes["disp"] = (np.asarray(topo_t).shape, np.asarray(topo_0).shape)
+        return real_disp(topo_t, topo_0, offset, **kw)
+
+    monkeypatch.setattr(b, "implied_sea_surface_offset", spy_offset)
+    monkeypatch.setattr(b, "solid_displacement", spy_disp)
+    dz, lats, lons = b.gia_delta_subset(16.5)
+
+    assert shapes["offset"] == ((_FAKE_N_LAT, _FAKE_N_LON),) * 2
+    assert shapes["disp"] == ((lats.size, lons.size),) * 2
+    assert lats.size < _FAKE_N_LAT and lons.size < _FAKE_N_LON
+    # ...and the numbers prove it: the planted local Δz survives only because the
+    # datum came from the tropics.  A datum taken from the window itself would
+    # cancel it to 0 m (or raise for want of a far field).
+    assert dz == pytest.approx(_FAKE_LOCAL_DZ_M, abs=1e-3)
+
+
+def test_a_regional_field_cannot_define_the_datum(tmp_path, monkeypatch):
+    """HONEST NEGATIVE: swapping the two would not silently mis-bake, it raises."""
+    from paleoeurope.gia.ice6g_topo import implied_sea_surface_offset
+
+    _fake_ice6g_dir(tmp_path, monkeypatch, epoch=16.5)
+    dz, lats, lons = b.gia_delta_subset(16.5)
+    regional = np.zeros((lats.size, lons.size))
+    with pytest.raises(ValueError, match="(?i)global|reference set"):
+        implied_sea_surface_offset(regional, regional)
+
+
+# --- requirement 3: the bake's NaN policy ------------------------------------
+
+
+def test_bake_nan_policy_table_has_no_zero_option():
+    assert b.BAKE_GIA_NAN_POLICIES == ("raise", "nodata")
+    assert "zero" not in b.BAKE_GIA_NAN_POLICIES
+    assert b.BAKE_GIA_NAN_POLICY == "raise"
+
+
+def test_bake_nan_policies_match_the_correction_pipeline():
+    """Drift guard: the bake and the tile pipeline must offer the same policies."""
+    from paleoeurope.gia.correction_pipeline import GIA_NAN_POLICIES
+
+    assert b.BAKE_GIA_NAN_POLICIES == GIA_NAN_POLICIES
+
+
+def test_build_paleo_dem_rejects_an_unknown_policy(tmp_path, monkeypatch):
+    _fake_ice6g_dir(tmp_path, monkeypatch, epoch=16.5)
+    monkeypatch.setattr(b, "BS_DEM", _fake_dem(tmp_path))
+    monkeypatch.setattr(b, "PALEO_TIF_DIR", tmp_path / "out")
+    for bad in ("zero", "fill", ""):
+        with pytest.raises(ValueError, match="(?i)gia_nan_policy"):
+            b.build_paleo_dem(16.5, gia_nan_policy=bad)
+
+
+def test_a_glaciated_cell_cannot_be_baked_as_bedrock(tmp_path, monkeypatch):
+    """THE definition of done for requirement 3 — default policy refuses."""
+    _fake_ice6g_dir(tmp_path, monkeypatch, epoch=16.5, ice_in_window=True)
+    monkeypatch.setattr(b, "BS_DEM", _fake_dem(tmp_path))
+    monkeypatch.setattr(b, "PALEO_TIF_DIR", tmp_path / "out")
+    with pytest.raises(b.UnknownGiaInBakeError) as exc:
+        b.build_paleo_dem(16.5)
+    msg = str(exc.value)
+    assert "ice" in msg.lower()
+    assert "0 m" in msg or "zero" in msg.lower()
+    assert not (tmp_path / "out").exists() or not list((tmp_path / "out").glob("*.tif"))
+
+
+def test_unknown_gia_in_bake_error_is_a_valueerror():
+    assert issubclass(b.UnknownGiaInBakeError, ValueError)
+
+
+def test_nodata_policy_writes_nodata_never_a_number(tmp_path, monkeypatch, caplog):
+    """The opt-out records the hole as the declared nodata, not as 0 m of Δz."""
+    rasterio = pytest.importorskip("rasterio")
+    _fake_ice6g_dir(tmp_path, monkeypatch, epoch=16.5, ice_in_window=True)
+    monkeypatch.setattr(b, "BS_DEM", _fake_dem(tmp_path))
+    monkeypatch.setattr(b, "PALEO_TIF_DIR", tmp_path / "out")
+
+    with caplog.at_level(logging.WARNING):
+        out = b.build_paleo_dem(16.5, gia_nan_policy="nodata")
+    assert "nodata" in caplog.text.lower()
+
+    with rasterio.open(out) as ds:
+        arr = ds.read(1)
+        assert ds.nodata == pytest.approx(b.BS_NODATA_M)
+    # The whole window is glaciated in this fixture, so EVERY cell is unknown.
+    assert (arr == np.float32(b.BS_NODATA_M)).all()
+    # and specifically: not the modern DEM with 0 m of correction, and nowhere
+    # near the +2000 m ice surface.
+    assert not np.isclose(arr, -50.0).any()
+    assert not (arr > 1000.0).any()
+
+
+def test_nodata_policy_does_not_leak_the_ice_surface_across_the_margin(
+    tmp_path, monkeypatch
+):
+    """Masking BEFORE smoothing: no finite cell may carry ice-margin contamination.
+
+    Half the window is glaciated, half is not.  A plain σ=2 Gaussian over the
+    unmasked field smears the ~+2000 m step outward; the masked smooth must not.
+    """
+    rasterio = pytest.importorskip("rasterio")
+    # Glaciate only the top three rows of the window (>= 47.5 N).  With the 8-cell
+    # rim that puts the unknown/known boundary near 43.5 N, so a tile running
+    # 40-47 N genuinely straddles it.
+    _fake_ice6g_dir(tmp_path, monkeypatch, epoch=16.5, ice_lat_min=47.5)
+    monkeypatch.setattr(
+        b, "BS_DEM", _fake_dem(tmp_path, lat_lo=40.0, lat_hi=47.0, n=48)
+    )
+    monkeypatch.setattr(b, "PALEO_TIF_DIR", tmp_path / "out")
+    out = b.build_paleo_dem(16.5, gia_nan_policy="nodata")
+
+    with rasterio.open(out) as ds:
+        arr = ds.read(1)
+    known = arr != np.float32(b.BS_NODATA_M)
+    assert known.any() and (~known).any(), "fixture must straddle the ice margin"
+    # modern DEM is -50 m and the true Δz is +7 m, so the honest answer is -43 m.
+    # 1 m of tolerance leaves no room for a smeared +2000 m step.
+    assert np.abs(arr[known] - (-50.0 + _FAKE_LOCAL_DZ_M)).max() < 1.0
+
+
+def test_the_modern_dems_own_holes_are_not_rewritten_as_nodata(tmp_path, monkeypatch):
+    """The GMRT tile carries NaN of its own, and it has always been written as NaN.
+
+    Rewriting it to BS_NODATA_M would change what
+    ``render_paleocostline_epoch(force_dem_mask=True)`` draws — NaN never compares
+    below the sea level, -9999 always does — so only the GIA hole may be
+    substituted.
+    """
+    rasterio = pytest.importorskip("rasterio")
+    from rasterio.transform import from_bounds
+
+    _fake_ice6g_dir(tmp_path, monkeypatch, epoch=16.5)  # ice-free window
+    dem_path = tmp_path / "holey_dem.tif"
+    n = 16
+    dem = np.full((n, n), -50.0, dtype=np.float32)
+    dem[0, 0] = np.nan
+    profile = {
+        "driver": "GTiff", "height": n, "width": n, "count": 1, "dtype": "float32",
+        "crs": "EPSG:4326",
+        "transform": from_bounds(30.0, 42.0, 35.0, 45.0, n, n),
+        "nodata": None,
+    }
+    with rasterio.open(dem_path, "w", **profile) as dst:
+        dst.write(dem, 1)
+    monkeypatch.setattr(b, "BS_DEM", dem_path)
+    monkeypatch.setattr(b, "PALEO_TIF_DIR", tmp_path / "out")
+
+    out = b.build_paleo_dem(16.5)
+    with rasterio.open(out) as ds:
+        arr = ds.read(1)
+    assert np.isnan(arr[0, 0]), "the DEM's own hole must stay NaN, not become nodata"
+    assert not (arr == np.float32(b.BS_NODATA_M)).any()
+    assert arr[1, 1] == pytest.approx(-50.0 + _FAKE_LOCAL_DZ_M, abs=1e-3)
+
+
+def test_build_paleo_dem_masks_before_smoothing_with_the_documented_rim():
+    """The smoothing must be the ice-aware one, with the 8-cell rim, σ handled once."""
+    src = inspect.getsource(b.build_paleo_dem)
+    assert "smooth_preserving_ice_mask" in src
+    assert "SMOOTHING_RIM_CELLS" in src
+    # apply_gia_delta would otherwise apply a SECOND, NaN-propagating Gaussian.
+    assert "sigma_blur=0.0" in src
+    assert SMOOTHING_RIM_CELLS == 8
+
+
+def test_module_never_turns_an_unknown_into_a_number():
+    src = Path(b.__file__).read_text(encoding="utf-8")
+    for banned in ("nan_to_num", "fillna", "np.isnan(dz)] = 0"):
+        assert banned not in src, banned
+
+
+def test_model_grid_must_bracket_the_tile_grid(tmp_path, monkeypatch):
+    """``apply_gia_delta`` fills out-of-bounds Δz with 0.0 — a zero-filled unknown.
+
+    The bake must refuse a tile that reaches outside the model window instead of
+    silently baking 0 m of GIA there.
+    """
+    _fake_ice6g_dir(tmp_path, monkeypatch, epoch=16.5)
+    monkeypatch.setattr(b, "PALEO_TIF_DIR", tmp_path / "out")
+    # Window is LAT_MIN-BUF..LAT_MAX+BUF = 39..49; this tile runs to 55 N.
+    monkeypatch.setattr(
+        b, "BS_DEM", _fake_dem(tmp_path, lat_lo=42.0, lat_hi=55.0, n=16)
+    )
+    with pytest.raises(ValueError, match="(?i)outside|bracket|extrapolat"):
+        b.build_paleo_dem(16.5)
+
+
+def test_the_real_black_sea_tile_is_bracketed_by_the_model_window():
+    """Regression: the guard above must never fire for the shipped tile."""
+    rasterio = pytest.importorskip("rasterio")
+    if not b.BS_DEM.exists():
+        pytest.skip(f"real BS DEM not available at {b.BS_DEM}")
+    with rasterio.open(b.BS_DEM) as ds:
+        bounds = ds.bounds
+    assert b.LAT_MIN - b.BUF <= bounds.bottom and bounds.top <= b.LAT_MAX + b.BUF
+    assert b.LON_MIN - b.BUF <= bounds.left and bounds.right <= b.LON_MAX + b.BUF
+
+
+# --- requirement 4: the Black Sea window is bit-identical --------------------
+
+#: ``gia_delta_subset`` output measured on the real ICE-6G files 2026-07-30,
+#: BEFORE the ice fields were threaded through: sha256 of the float32 array
+#: bytes, then (min, max, mean) in metres.  The window is ice-free at every
+#: shipped epoch, so passing ``sftgif`` must change nothing whatsoever — these
+#: hashes are the no-regression evidence for the 13 rasters about to be re-baked.
+_BS_DZ_BASELINE = {
+    22: ("c46d13bac6be9f2bc038017e0c1f24277a0a7fc20024fbe27b8f0fdf3eceefe1",
+         1.091156, 23.259857, 8.673641),
+    18: ("a388b18f8e28db225b211cf27881eb8717f9532e7746e95b3a1372d88d2186e1",
+         1.325134, 24.317810, 9.325067),
+    16.5: ("21feb75a613253309e1ad5c3827ab0bc2df8044f6db60f54abf7773967750860",
+           1.979919, 25.218689, 10.337350),
+    14.5: ("c108007092b993bce06f711ad7add482b8e2215da6ae48ba25a3d666b3fd1669",
+           2.693756, 25.653961, 11.252694),
+    12: ("7f81e0541873005950edaa7ade5f283729eb321aa0fed9f4b2727292e8af1cc8",
+         3.178345, 22.994263, 11.266631),
+    0: ("fa50ab915a7f7457913d3b731979ebc80a68972522c9dd331161cf619e84cd37",
+        0.000000, 0.000000, 0.000000),
+}
+
+
+@pytest.mark.parametrize("epoch", sorted(_BS_DZ_BASELINE))
+def test_gia_delta_subset_is_bit_identical_to_the_pre_guard_values(epoch):
+    _real_ice6g_or_skip(epoch)
+    want_hash, want_min, want_max, want_mean = _BS_DZ_BASELINE[epoch]
+    dz, _, _ = b.gia_delta_subset(epoch)
+    assert dz.dtype == np.float32
+    assert np.isfinite(dz).all(), "the Black Sea window has no glaciated cell"
+    got = hashlib.sha256(np.ascontiguousarray(dz).tobytes()).hexdigest()
+    assert got == want_hash, (
+        f"{epoch} ka Δz changed: min={dz.min():.6f} max={dz.max():.6f} "
+        f"mean={dz.mean():.6f} vs baseline {want_min}/{want_max}/{want_mean}"
+    )
+    assert float(dz.min()) == pytest.approx(want_min, abs=5e-6)
+    assert float(dz.max()) == pytest.approx(want_max, abs=5e-6)
+
+
+def test_black_sea_window_is_ice_free_at_every_shipped_epoch():
+    """Why ``"raise"`` is the right default for THIS bake, measured not assumed."""
+    xr = pytest.importorskip("xarray")
+    _real_ice6g_or_skip(16.5)
+    for epoch in b.EPOCHS_KA:
+        path = b.ICE6G_DIR / b._epoch_filename(epoch)
+        if not path.exists():
+            pytest.skip(f"real ICE-6G file not available at {path}")
+        with xr.open_dataset(path) as ds:
+            sub = ds.sel(
+                lat=slice(b.LAT_MIN - b.BUF, b.LAT_MAX + b.BUF),
+                lon=slice(b.LON_MIN - b.BUF, b.LON_MAX + b.BUF),
+            )
+            assert float(np.nanmax(sub["sftgif"].values)) == 0.0, epoch
+
+
+# --- requirement 5: the corrected datum, and the range it now returns --------
+
+
+def test_gia_delta_subset_returns_the_corrected_datum_range_at_16_5ka():
+    """Δz over the BS window at 16.5 ka is [+1.98, +25.22] m.
+
+    Under the retired deep-ocean datum the same window read
+    [-27.25, -4.01] m — the whole field 29.232 m too low, which is what
+    over-flooded 47 712 km² of shelf.  Sign and offset are both pinned here.
+    """
+    _real_ice6g_or_skip(16.5)
+    dz, _, _ = b.gia_delta_subset(16.5)
+    assert float(dz.min()) == pytest.approx(1.979919, abs=1e-4)
+    assert float(dz.max()) == pytest.approx(25.218689, abs=1e-4)
+    assert float(dz.min()) > 0.0, "the corrected datum lifts the whole window"
+    # the buggy values, explicitly excluded
+    assert float(dz.min()) != pytest.approx(1.979919 - 29.232, abs=0.1)
+
+
+def test_the_datum_call_still_uses_no_deep_threshold():
+    """The retired positional argument must not have crept back in."""
+    src = inspect.getsource(b.gia_delta_subset)
+    assert "deep_threshold" not in src
+    assert "implied_sea_surface_offset" in src

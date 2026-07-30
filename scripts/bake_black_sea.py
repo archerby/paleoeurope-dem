@@ -26,10 +26,55 @@ PALEO-DEM
 ---------
 paleo_dem(t) = H_modern + Δz_solid(t)   (present-datum solid-earth displacement)
 Δz_solid(t)  = [Topo(t) - Topo(0)] - sea_surface_offset(t)   (ICE-6G_C Topo)
-sea_surface_offset(t) = median over deep ocean of [Topo(t) - Topo(0)]
+sea_surface_offset(t) = median ΔTopo over FAR-FIELD ICE-FREE TROPICAL CONTINENTAL
+    LAND, computed from the GLOBAL Topo field
     (Orog is clamped to 0 over water -> GIA vanishes under the sea; bare ΔTopo
      double-counts the epoch sea surface. See paleoeurope.gia.ice6g_topo.)
 ice_height = 0 everywhere (no ice sheet over the Black Sea).
+
+THE DATUM IS GLOBAL, THE DISPLACEMENT IS LOCAL
+----------------------------------------------
+``gia_delta_subset`` hands the **global** ``Topo`` field to
+:func:`~paleoeurope.gia.ice6g_topo.implied_sea_surface_offset` and only the
+**regional** subset to :func:`~paleoeurope.gia.ice6g_topo.solid_displacement`.
+Getting that backwards is precisely the bug that was retired on 2026-07-30: the
+datum used to be the deep-ocean median, i.e. it was taken from cells that are
+themselves displaced (the ocean floor stands ~+29 to +32 m higher at the LGM with
+the water load absent), which zeroed a real signal and pushed it onto the
+continents sign-flipped.  A regional cut cannot define a global far-field datum at
+all and now raises rather than improvising.  Pinned by
+``tests/test_bake_black_sea.py::
+test_datum_is_taken_from_the_global_field_and_displacement_from_the_subset``.
+
+THE ICE-SURFACE GUARD, AND THIS BAKE'S NaN POLICY
+-------------------------------------------------
+Where ``sftgif > 0`` ICE-6G ``Topo`` is the **ice surface, not bedrock**, and these
+files carry no bedrock-under-ice field at all.  ``gia_delta_subset`` therefore
+passes ``sftgif`` for BOTH endpoints through to ``solid_displacement``, which
+returns **NaN** over ice.  NaN means *unknown*, end to end: there is no code path
+here that turns it into a number.
+
+``build_paleo_dem(epoch, gia_nan_policy=...)`` decides what to do with such a
+hole, with the same two options and the same names as
+:data:`paleoeurope.gia.correction_pipeline.GIA_NAN_POLICIES`, and deliberately
+**no** ``"zero"``:
+
+  * ``"raise"`` (default) — abort with :class:`UnknownGiaInBakeError`.  Correct for
+    every bbox this script is pointed at today: the Black-Sea window is ice-free at
+    all 13 shipped epochs (measured, not assumed — see
+    ``test_black_sea_window_is_ice_free_at_every_shipped_epoch``), as is the Caspian
+    bbox, so an unknown cell means a bug or the wrong epoch, not a fact about the
+    world.
+  * ``"nodata"`` — for a future bbox that genuinely straddles a palaeo-ice margin.
+    Unknown cells are written as the raster's declared nodata
+    (:data:`BS_NODATA_M`), never as 0 m of correction.
+
+Masking runs BEFORE smoothing, via
+:func:`~paleoeurope.gia.ice6g_topo.smooth_preserving_ice_mask` with the documented
+:data:`~paleoeurope.gia.ice6g_topo.SMOOTHING_RIM_CELLS` rim; ``apply_gia_delta`` is
+then called with ``sigma_blur=0.0`` so its own plain, NaN-propagating Gaussian does
+not smooth a second time.  For an ice-free window this is bit-for-bit the historical
+computation (same σ, same ``mode="reflect"`` boundary, same float64 promotion).
 
 OUTPUT
 ------
@@ -59,6 +104,7 @@ Run (repo NOT pip-installed):
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from pathlib import Path
@@ -81,7 +127,13 @@ import rasterio
 import xarray as xr
 
 from paleoeurope.gia.deformation import apply_gia_delta
-from paleoeurope.gia.ice6g_topo import implied_sea_surface_offset, solid_displacement
+from paleoeurope.gia.ice6g_topo import (
+    SMOOTHING_RIM_CELLS,
+    ice_surface_mask,
+    implied_sea_surface_offset,
+    smooth_preserving_ice_mask,
+    solid_displacement,
+)
 from paleoeurope.viz.paleocostline_render import (
     RenderConfig,
     get_sea_level_for_epoch,
@@ -242,6 +294,64 @@ SCENARIOS = ("gradual", "catastrophic")
 LAT_MIN, LAT_MAX = 40.0, 48.0
 LON_MIN, LON_MAX = 27.0, 42.0
 BUF = 1.0
+
+logger = logging.getLogger(__name__)
+
+# ICE-6G icemask variable name.  Where it is > 0 the shipped ``Topo`` is the ICE
+# SURFACE and there is no bedrock field to fall back on, so Δz is UNKNOWN there.
+ICE6G_ICEMASK_VAR = "sftgif"
+
+# Gaussian σ (in ICE-6G cells) applied to Δz before interpolation onto the tile.
+# Historically this was passed to apply_gia_delta as ``sigma_blur``; it is now
+# applied here, through smooth_preserving_ice_mask, so that masking precedes
+# smoothing.  The VALUE must not change: 2.0 is what every shipped bs_*.tif used.
+GIA_SIGMA_BLUR = 2.0
+
+# Nodata written into the per-epoch paleo-DEM GeoTIFF.  Named so the raster header
+# and the value substituted for an unknown cell cannot drift apart.
+BS_NODATA_M = -9999.0
+
+# What build_paleo_dem() does when the GIA correction is UNKNOWN over part of the
+# window (ICE-6G 'Topo' is the ice surface there and these files ship no
+# bedrock-under-ice field).
+#
+#   "raise"  — abort.  Correct for every bbox this script is pointed at today: the
+#              Black-Sea window is ice-free at all 13 shipped epochs (measured; see
+#              tests/test_bake_black_sea.py::
+#              test_black_sea_window_is_ice_free_at_every_shipped_epoch) and so is
+#              the Caspian bbox, so an unknown cell means a bug or the wrong epoch,
+#              not a fact about the world.
+#   "nodata" — the legitimate case for a FUTURE bbox that genuinely straddles a
+#              palaeo-ice margin (Europe / Doggerland at 21 ka).  Unknown cells are
+#              written as BS_NODATA_M and logged, never as 0 m of correction.
+#
+# There is deliberately NO "zero": a zero Δz reads as "this ground did not move"
+# over exactly the ground that moved most.
+#
+# THESE MUST STAY IDENTICAL to paleoeurope.gia.correction_pipeline.GIA_NAN_POLICIES.
+# They are duplicated rather than imported so that a bake script does not drag in
+# the whole tile pipeline (Ice6gLoader, ICE-7G, rasterio windowed reads) for one
+# tuple and one exception class; the drift guard is
+# tests/test_bake_black_sea.py::test_bake_nan_policies_match_the_correction_pipeline.
+BAKE_GIA_NAN_POLICIES: tuple[str, ...] = ("raise", "nodata")
+BAKE_GIA_NAN_POLICY = "raise"
+
+
+class UnknownGiaInBakeError(ValueError):
+    """The bake was asked to write a raster whose GIA correction is unknown.
+
+    The bake counterpart of
+    :class:`paleoeurope.gia.correction_pipeline.UnknownGiaCorrectionError`, raised
+    when ``gia_nan_policy="raise"`` (the default) and part of the window is
+    glaciated at the epoch or today.  ICE-6G ``Topo`` is the **ice surface** there
+    and the shipped 10 arcmin files carry no bedrock-under-ice field at all, so
+    adding that cell to a modern DEM is meaningless and zero-filling it is worse.
+
+    Resolve it by restricting the bbox/epoch to ice-free ground (what the Black-Sea
+    and Caspian windows already are), by sourcing Δz from ICE-7G's
+    bedrock-deformation field, or by passing ``gia_nan_policy="nodata"`` to record
+    the hole honestly as nodata.  It will not be filled with 0 m.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -502,12 +612,59 @@ def pontic_level(df: pd.DataFrame, epoch: float, scenario: str = "gradual") -> f
     return basin_level(df, epoch, scenario, basin="pontic")
 
 
-def gia_delta_subset(epoch: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _icemask_subset(ds_sub) -> np.ndarray | None:
+    """``sftgif`` (percent) from an already-subset ICE-6G dataset, or ``None``.
+
+    ``None`` means the file carries no icemask at all, which is *no ice
+    information* — not *no ice*.  Callers must not conflate the two; see
+    :func:`gia_delta_subset`.
+    """
+    if ICE6G_ICEMASK_VAR not in ds_sub.variables:
+        return None
+    return ds_sub[ICE6G_ICEMASK_VAR].values.astype(np.float64)
+
+
+def gia_delta_subset(
+    epoch: float, *, require_ice_information: bool = True
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return (dz_solid, model_lats, model_lons) for the BS region at *epoch*.
 
-    dz_solid = present-datum solid-earth displacement (Topo-based), subset to the
-    BS bbox +/- BUF.  The sea-surface offset is computed from the GLOBAL Topo field
-    (deep-ocean median) so the datum is internally consistent with ICE-6G.
+    ``dz_solid`` = present-datum solid-earth displacement (Topo-based), subset to
+    the BS bbox +/- ``BUF``, **NaN wherever ICE-6G ``Topo`` is the ice surface
+    rather than the solid surface**.
+
+    Two different grids are used on purpose and it is not interchangeable:
+
+    * the **GLOBAL** ``Topo`` field defines the sea-surface datum (median ΔTopo over
+      far-field ice-free tropical continental land — a global far-field quantity
+      that a regional cut cannot define and that
+      :func:`~paleoeurope.gia.ice6g_topo.implied_sea_surface_offset` now refuses to
+      improvise);
+    * the **REGIONAL** subset, with its own ``sftgif`` for both endpoints, defines
+      the local displacement.
+
+    This is the only code path in the project that runs GIA on the real ICE-6G
+    distribution, so the ice-surface guard has to be armed here or it is armed
+    nowhere.  The Black-Sea window happens to be ice-free at every shipped epoch,
+    which is exactly why the missing guard was invisible.
+
+    Parameters
+    ----------
+    require_ice_information : bool
+        When the ICE-6G file carries no ``sftgif`` at all, refuse (default) rather
+        than fall back on ``solid_displacement``'s
+        :class:`~paleoeurope.gia.ice6g_topo.IceSurfaceUnmaskedWarning`.  A warning
+        printed on every epoch of every run is not a guard.  Pass ``False`` only
+        for a field you have separately established to be ice-free; the returned
+        array then holds ICE-SURFACE elevations over any glaciated cell.
+
+    Raises
+    ------
+    ValueError
+        If ``sftgif`` is absent from both endpoints and *require_ice_information*
+        is true, or if the subset contains a non-finite ``Δz`` that the icemask does
+        not explain (a stray ``_FillValue`` in ``Topo`` must not masquerade as an
+        ice hole).
     """
     f_t = ICE6G_DIR / _epoch_filename(epoch)
     f_0 = ICE6G_DIR / _epoch_filename(0)
@@ -515,7 +672,7 @@ def gia_delta_subset(epoch: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     lon_lo, lon_hi = LON_MIN - BUF, LON_MAX + BUF
 
     with xr.open_dataset(f_t) as ds_t, xr.open_dataset(f_0) as ds_0:
-        # Global sea-surface offset (deep-ocean median of ΔTopo).
+        # Sea-surface datum: GLOBAL field, deliberately not the subset below.
         offset = implied_sea_surface_offset(
             ds_t["Topo"].values.astype(np.float64),
             ds_0["Topo"].values.astype(np.float64),
@@ -526,13 +683,112 @@ def gia_delta_subset(epoch: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         topo_0 = sub_0["Topo"].values.astype(np.float64)
         model_lats = sub_t["lat"].values.astype(np.float64)
         model_lons = sub_t["lon"].values.astype(np.float64)
+        sftgif_t = _icemask_subset(sub_t)
+        sftgif_0 = _icemask_subset(sub_0)
 
-    dz = solid_displacement(topo_t, topo_0, offset).astype(np.float32)  # (M, N)
+    if sftgif_t is None and sftgif_0 is None and require_ice_information:
+        raise ValueError(
+            f"neither {f_t.name} nor {f_0.name} carries a '{ICE6G_ICEMASK_VAR}' "
+            "field, so it is UNKNOWABLE from these files whether the "
+            f"{lat_lo:g}..{lat_hi:g}N / {lon_lo:g}..{lon_hi:g}E window is glaciated. "
+            "Where it is, ICE-6G 'Topo' is the ICE SURFACE (up to +3506 m), not "
+            "bedrock, and there is no bedrock-under-ice field to fall back on.  "
+            "Supply files with the icemask, or pass "
+            "require_ice_information=False if you have separately established that "
+            "this field is ice-free."
+        )
+
+    # dilate_cells=0 is correct here: the rim is applied by
+    # smooth_preserving_ice_mask() in build_paleo_dem(), which is what smooths.
+    dz = solid_displacement(
+        topo_t,
+        topo_0,
+        offset,
+        sftgif_t=sftgif_t,
+        sftgif_0=sftgif_0,
+    ).astype(np.float32)  # (M, N)
+
+    # NaN must mean "ice surface, no bedrock in these files".  A _FillValue (1e+20)
+    # or NaN in Topo would otherwise be indistinguishable from an ice hole, and a
+    # data problem would be silently absorbed into the ice policy below.
+    unknown = ~np.isfinite(dz)
+    if unknown.any():
+        ice = ice_surface_mask(sftgif_t, sftgif_0)
+        unexplained = unknown if ice is None else (unknown & ~ice)
+        if unexplained.any():
+            raise ValueError(
+                f"{int(unexplained.sum())} cells of the {epoch:g} ka Black-Sea "
+                "window have a non-finite Δz that the icemask does not explain — "
+                "most likely a _FillValue (1e+20) or NaN in 'Topo'.  That is a data "
+                "problem, not an ice hole; it must not be absorbed into the "
+                "gia_nan_policy path."
+            )
+
     return dz, model_lats, model_lons
 
 
-def build_paleo_dem(epoch: float) -> Path:
-    """Bake the GIA-corrected paleo-DEM GeoTIFF for *epoch*; return its path."""
+def _require_model_grid_brackets_tile(
+    model_lats: np.ndarray,
+    model_lons: np.ndarray,
+    tile_lats: np.ndarray,
+    tile_lons: np.ndarray,
+) -> None:
+    """Refuse a tile that reaches outside the GIA model window.
+
+    :func:`~paleoeurope.gia.deformation.apply_gia_delta` interpolates with
+    ``fill_value=0.0``, so any tile pixel outside the model grid would silently be
+    baked with **0 m of GIA** — a zero-filled unknown wearing the same clothes as a
+    measured zero.  The Black-Sea tile is comfortably inside the bbox +/- ``BUF``
+    window (27.00-42.01 E / 39.99-48.00 N against 26-43 E / 39-49 N), so this never
+    fires today; it exists so that repointing the bbox cannot reintroduce the
+    silent fill.
+    """
+    for name, model, tile in (
+        ("lat", model_lats, tile_lats),
+        ("lon", model_lons, tile_lons),
+    ):
+        m_lo, m_hi = float(np.min(model)), float(np.max(model))
+        t_lo, t_hi = float(np.min(tile)), float(np.max(tile))
+        if t_lo < m_lo or t_hi > m_hi:
+            raise ValueError(
+                f"the DEM tile spans {name} {t_lo:.4f}..{t_hi:.4f} but the ICE-6G "
+                f"model window only covers {m_lo:.4f}..{m_hi:.4f}: pixels outside "
+                "it would be extrapolated by apply_gia_delta as 0 m of GIA, i.e. a "
+                "zero-filled unknown.  Widen LAT_MIN/LAT_MAX/LON_MIN/LON_MAX/BUF "
+                "to cover the tile."
+            )
+
+
+def build_paleo_dem(
+    epoch: float, *, gia_nan_policy: str = BAKE_GIA_NAN_POLICY
+) -> Path:
+    """Bake the GIA-corrected paleo-DEM GeoTIFF for *epoch*; return its path.
+
+    Parameters
+    ----------
+    gia_nan_policy : {'raise', 'nodata'}
+        What to do when the GIA correction is unknown over part of the window
+        because ICE-6G ``Topo`` is the ice surface there.  See
+        :data:`BAKE_GIA_NAN_POLICIES`.  There is no ``'zero'``.
+
+    Raises
+    ------
+    UnknownGiaInBakeError
+        With ``gia_nan_policy='raise'`` (the default) when any cell of the window is
+        glaciated at *epoch* or today.
+    ValueError
+        For an unknown *gia_nan_policy*, or if the DEM tile is not bracketed by the
+        ICE-6G model window.
+    """
+    if gia_nan_policy not in BAKE_GIA_NAN_POLICIES:
+        raise ValueError(
+            f"gia_nan_policy={gia_nan_policy!r} is not one of "
+            f"{BAKE_GIA_NAN_POLICIES}.  There is deliberately no 'zero' policy: "
+            "0 m of correction is a legitimate MEASURED value over stable far-field "
+            "ground, so writing it for an unknown cell makes the two "
+            "indistinguishable."
+        )
+
     with rasterio.open(BS_DEM) as ds:
         modern_dem = ds.read(1).astype(np.float32)
         transform = ds.transform
@@ -546,18 +802,84 @@ def build_paleo_dem(epoch: float) -> Path:
     tile_lats = (transform * (np.zeros_like(rows) + 0.5, rows + 0.5))[1]
 
     dz, model_lats, model_lons = gia_delta_subset(epoch)
-    ice_height = np.zeros_like(dz)
+    _require_model_grid_brackets_tile(model_lats, model_lons, tile_lats, tile_lons)
+
+    # ── Unknown Δz policy ──────────────────────────────────────────────────────
+    # NaN here means "ICE-6G Topo is the ice surface, there is no solid surface in
+    # these files", not "no correction".  It must never be added to the DEM as a
+    # number, and it must never reach the raster as a bare NaN under a header that
+    # declares nodata=BS_NODATA_M.
+    gia_unknown = ~np.isfinite(dz)
+    n_unknown = int(np.count_nonzero(gia_unknown))
+    if n_unknown:
+        detail = (
+            f"epoch {epoch:g} ka: the GIA correction is unknown over {n_unknown} of "
+            f"{gia_unknown.size} ICE-6G cells "
+            f"({100.0 * n_unknown / gia_unknown.size:.1f}%) of the "
+            f"{LAT_MIN - BUF:g}..{LAT_MAX + BUF:g}N / {LON_MIN - BUF:g}.."
+            f"{LON_MAX + BUF:g}E window, because ICE-6G 'Topo' is the ICE SURFACE "
+            "there and these files carry no bedrock-under-ice field."
+        )
+        if gia_nan_policy == "raise":
+            raise UnknownGiaInBakeError(
+                detail
+                + "  Restrict this bbox/epoch to ice-free ground, take Δz from "
+                "ICE-7G's bedrock-deformation field, or pass "
+                "gia_nan_policy='nodata' to record the hole as nodata.  It will "
+                "not be filled with 0 m."
+            )
+        logger.warning(
+            "%s  gia_nan_policy='nodata': written as nodata=%r, NOT as 0 m of "
+            "correction.",
+            detail,
+            BS_NODATA_M,
+        )
+
+    # ── Mask BEFORE smoothing ─────────────────────────────────────────────────
+    # solid_displacement() already NaN-ed the ice cells (inside gia_delta_subset);
+    # this is the ice-aware smooth, with the documented SMOOTHING_RIM_CELLS rim so
+    # the margin cells resting on one-sided support are discarded rather than
+    # published.  mode="reflect" is NOT this helper's default ("nearest"): it is
+    # chosen to reproduce exactly the boundary handling apply_gia_delta applied
+    # historically, so an ice-free window is bit-for-bit unchanged.  A plain
+    # gaussian_filter here would smear the ~+2000 m ice-margin step outward (>1 m
+    # out to 6-7 cells, measured) or propagate NaN over the whole kernel support.
+    dz_smooth = smooth_preserving_ice_mask(
+        dz.astype(np.float64),
+        sigma=GIA_SIGMA_BLUR,
+        dilate_cells=SMOOTHING_RIM_CELLS,
+        mode="reflect",
+    )
+    ice_height = np.zeros_like(dz_smooth)
 
     paleo_dem, _ice = apply_gia_delta(
         modern_dem,
         model_lats,
         model_lons,
-        dz,
+        dz_smooth,
         ice_height,
         tile_lats,
         tile_lons,
-        sigma_blur=2.0,
+        # Already smoothed above, ice-mask-preserving.  apply_gia_delta's own
+        # gaussian_filter is a plain one and would both smooth twice and propagate
+        # NaN across the kernel support; 0.0 makes it an exact identity.
+        sigma_blur=0.0,
     )
+
+    # Unknown Δz interpolates to NaN on the tile grid.  Write the DECLARED nodata,
+    # which is an honest "unknown", and never a number that reads as elevation.
+    #
+    # ONLY cells the GIA hole created: the shipped GMRT tile carries NaN of its own
+    # (outside the Black-Sea-proper cut), and those NaNs have always been written
+    # through as NaN.  Rewriting them to BS_NODATA_M would change what
+    # render_paleocostline_epoch(force_dem_mask=True) draws — NaN never compares
+    # below the sea level, -9999 always does — so the modern DEM's own holes are
+    # left exactly as they were.  Same discrimination as
+    # correction_pipeline's ``gia_unknown & ~nodata_mask``.
+    if n_unknown:
+        unknown_tile = ~np.isfinite(paleo_dem) & np.isfinite(modern_dem)
+        if unknown_tile.any():
+            paleo_dem = np.where(unknown_tile, np.float32(BS_NODATA_M), paleo_dem)
 
     PALEO_TIF_DIR.mkdir(parents=True, exist_ok=True)
     out_tif = PALEO_TIF_DIR / f"bs_{epoch}ka.tif"
@@ -569,7 +891,7 @@ def build_paleo_dem(epoch: float) -> Path:
         "dtype": "float32",
         "crs": crs,
         "transform": transform,
-        "nodata": -9999.0,
+        "nodata": BS_NODATA_M,
         "compress": "deflate",
     }
     with rasterio.open(out_tif, "w", **profile) as dst:

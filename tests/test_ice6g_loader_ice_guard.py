@@ -18,6 +18,17 @@ masking.  These tests pin exactly that, plus the two things that must not regres
 * on an **ice-free** window the answer is bit-for-bit the plain
   ``gaussian_filter(dz, sigma=2.0)`` that this loader has always returned.
 
+Since 2026-07-30 it also covers the two defects that kept ``get_fields`` from ever
+running on the **real** distribution:
+
+* the shipped ``I6_C.VM5a_10min.<epoch>.nc`` files hold **one epoch each and no time
+  dimension**, so the old ``_detect_dim(ds, ("time","Time","t"))`` raised ``KeyError``
+  on every one of them.  The loader now has an explicit epoch-pair API
+  (:meth:`Ice6gLoader.from_epoch_files`, :meth:`Ice6gLoader.from_epoch_directory`);
+* those files run ``lon 0..360`` while every raster in this project runs −180..180, so
+  a negative-longitude bbox used to select the wrong columns — a *truncated* window
+  for Doggerland, and a silently **empty** one for anything wholly west of Greenwich.
+
 Deliberately in its own file: ``tests/test_gia.py`` and ``tests/test_gia_topo.py`` are
 being worked on concurrently.
 
@@ -29,6 +40,7 @@ surface, ``Orog`` clamped to 0 over water, and ``Topo`` = the **ice surface** wh
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -39,6 +51,7 @@ from scipy.ndimage import gaussian_filter
 from paleoeurope.gia.ice6g_loader import (
     GiaDeltaHasIceSurfaceNaNWarning,
     Ice6gLoader,
+    ice6g_epoch_filename,
 )
 from paleoeurope.gia.ice6g_topo import (
     global_latitude_grid,
@@ -263,3 +276,280 @@ def test_ice_free_window_matches_the_plain_sigma2_gaussian(global_nc):
     # The step edge must be inside the window, or this test proves nothing.
     assert sub.max() - sub.min() > 10.0
     np.testing.assert_allclose(dz, gaussian_filter(sub, sigma=2.0), atol=1e-4)
+
+
+# ===========================================================================
+# Defect 2 — longitude convention.  0..360 file, −180..180 request.
+# ===========================================================================
+#
+# The synthetic fixture above already runs lon 0.5..359.5, exactly like the real
+# files, so the wrap can be pinned here without touching the disk.
+
+
+def test_bbox_west_of_greenwich_is_not_silently_empty(global_nc):
+    """A wholly negative-longitude bbox must return real columns, or raise.
+
+    Before the fix ``(lon >= -11) & (lon <= -4)`` matched **nothing** on a 0..360
+    grid, and ``isel`` with an all-False mask happily returned zero-column arrays.
+    The caller (``correction_pipeline`` over Ireland, or any Europe-wide extent)
+    then got empty arrays with no error at all.
+    """
+    bounds = (-11.0, 2.0, -4.0, 20.0)   # tropical band → ice-free, datum derivable
+    _lats, lons, dz, _ice_h = _fields(global_nc, bounds)
+
+    assert lons.size > 0 and dz.shape[1] == lons.size, (
+        "a west-of-Greenwich window came back with zero columns; the 0..360 file "
+        "longitudes were compared raw against a negative request"
+    )
+    assert lons.min() >= -12.0 and lons.max() <= -3.0, (
+        f"longitudes must be returned in the requested frame, got {lons.min()}..{lons.max()}"
+    )
+    np.testing.assert_allclose(dz, 0.0, atol=1e-3)
+
+
+def test_bbox_straddling_the_prime_meridian_is_contiguous(global_nc):
+    """Doggerland-shaped request: the western half must not be dropped.
+
+    ``(lon >= -5) & (lon <= 9)`` is *not* empty on a 0..360 grid — it matches
+    0..9 — so this half of the defect never even looked broken.  It silently
+    truncated the window at Greenwich.
+    """
+    bounds = (-4.0, 2.0, 8.0, 20.0)
+    _lats, lons, dz, _ice_h = _fields(global_nc, bounds)
+
+    assert (lons < 0).any(), "the western half of the window was dropped"
+    assert (lons > 0).any()
+    assert np.all(np.diff(lons) > 0), f"longitudes are not ascending: {lons}"
+    # No 350°-wide jump: the antimeridian split must have been re-joined.
+    assert float(np.max(np.diff(lons))) < 2.0 * LON_STEP
+    np.testing.assert_allclose(dz, 0.0, atol=1e-3)
+
+
+def test_degenerate_selection_raises_rather_than_returning_empty(global_nc):
+    """A bbox off the file's grid must raise, never hand back empty arrays."""
+    loader = Ice6gLoader(global_nc)
+    try:
+        with pytest.raises(ValueError, match="(?i)selects no|empty|outside"):
+            loader.get_fields(epoch_ka=18, bounds=(5.0, 95.0, 25.0, 99.0))
+    finally:
+        loader.close()
+
+
+# ===========================================================================
+# Defect 1 — the real per-epoch files.  One epoch each, no time dimension.
+# ===========================================================================
+#
+# Resolved through ``PALEO_DATA_ROOT`` with a repo-relative fallback, the same
+# indirection ``scripts/bake_black_sea.py`` uses.  A hardcoded ``D:/…`` literal here
+# would make every one of these tests skip *silently* on any other machine (CI box
+# LXC 128 included) while still reporting green — that has happened before.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_DEFAULT_PALEO_DATA_ROOT = _REPO_ROOT.parents[1] / "Paleo-Europe_3D"
+
+
+def _ice6g_raw_dir() -> Path:
+    root = Path(os.environ.get("PALEO_DATA_ROOT") or _DEFAULT_PALEO_DATA_ROOT)
+    return root.resolve() / "data" / "raw" / "ICE6G"
+
+
+ICE6G_RAW_DIR = _ice6g_raw_dir()
+REAL_EPOCH_KA = 16.5
+REAL_REFERENCE_KA = 0.0
+_REAL_FILES = (
+    ICE6G_RAW_DIR / ice6g_epoch_filename(REAL_EPOCH_KA),
+    ICE6G_RAW_DIR / ice6g_epoch_filename(REAL_REFERENCE_KA),
+)
+
+requires_real_ice6g = pytest.mark.skipif(
+    not all(p.exists() for p in _REAL_FILES),
+    reason=f"real ICE-6G per-epoch files not found under {ICE6G_RAW_DIR} "
+           "(set PALEO_DATA_ROOT to the Paleo-Europe_3D tree)",
+)
+
+# Manych spillway — the corridor the Khvalynian transgression drains through.
+MANYCH_LON, MANYCH_LAT = 44.119, 45.773
+MANYCH_BOUNDS = (42.0, 44.0, 46.5, 47.5)
+MANYCH_MODERN_SILL_M = 23.00
+#: Δz_solid at the 10 arcmin cell nearest the sill at 16.5 ka, from the corrected
+#: far-field datum (77.9058 m).  Raw value +2.7010 m; ``get_fields`` returns it after
+#: the σ=2 Gaussian, which over this ice-free corridor moves it by +0.025 m.
+MANYCH_DZ_16K5_M = 2.701
+#: What the retired deep-ocean datum produced here.  Kept only as a tripwire.
+MANYCH_DZ_DEEP_OCEAN_ARTEFACT_M = -26.5
+
+
+def _real_pair_loader() -> Ice6gLoader:
+    return Ice6gLoader.from_epoch_directory(
+        ICE6G_RAW_DIR, REAL_EPOCH_KA, reference_ka=REAL_REFERENCE_KA
+    )
+
+
+@requires_real_ice6g
+def test_real_per_epoch_files_open_at_all():
+    """The shipped files have no ``time`` dimension; opening one must not KeyError."""
+    loader = _real_pair_loader()
+    try:
+        lats, lons, dz, _ice_h = loader.get_fields(
+            epoch_ka=REAL_EPOCH_KA, bounds=MANYCH_BOUNDS
+        )
+    finally:
+        loader.close()
+    assert dz.shape == (lats.size, lons.size)
+    assert lats.size > 5 and lons.size > 5
+
+
+@requires_real_ice6g
+def test_manych_sill_matches_the_corrected_datum():
+    """+2.701 m of UPLIFT at the sill at 16.5 ka — not the −26.5 m the bug produced.
+
+    This is the whole point of the 2026-07-30 datum fix reaching production: the
+    palaeo-sill stands at 23.00 + 2.70 = 25.70 m a.s.l., i.e. **higher** than today,
+    so the Khvalynian spill west is harder than a modern-sill reading, not easier.
+    """
+    loader = _real_pair_loader()
+    try:
+        lats, lons, dz, _ice_h = loader.get_fields(
+            epoch_ka=REAL_EPOCH_KA, bounds=MANYCH_BOUNDS
+        )
+    finally:
+        loader.close()
+
+    i = int(np.argmin(np.abs(lats - MANYCH_LAT)))
+    j = int(np.argmin(np.abs(lons - MANYCH_LON)))
+    value = float(dz[i, j])
+
+    assert np.isfinite(value), "the sill cell is ice-free at 16.5 ka; NaN is a bug"
+    assert value == pytest.approx(MANYCH_DZ_16K5_M, abs=0.05), (
+        f"Δz_solid at the Manych sill is {value:.4f} m, expected "
+        f"{MANYCH_DZ_16K5_M} m (± the σ=2 smoothing).  If it is near "
+        f"{MANYCH_DZ_DEEP_OCEAN_ARTEFACT_M} m the deep-ocean datum is back."
+    )
+    sill = MANYCH_MODERN_SILL_M + value
+    assert sill == pytest.approx(25.70, abs=0.05), (
+        f"palaeo-sill {sill:.2f} m a.s.l.; the corrected value is 25.70 m"
+    )
+
+
+@requires_real_ice6g
+def test_negative_longitude_bbox_on_the_real_files():
+    """Doggerland on the real 0..360 grid: never empty, never truncated."""
+    loader = _real_pair_loader()
+    try:
+        _lats, lons, dz, _ice_h = loader.get_fields(
+            epoch_ka=REAL_EPOCH_KA, bounds=(-4.0, 51.0, 8.0, 57.0)
+        )
+    finally:
+        loader.close()
+
+    assert lons.size > 0 and dz.size > 0, "Doggerland window came back empty"
+    assert (lons < 0).any(), "the western half of Doggerland was silently dropped"
+    assert np.all(np.diff(lons) > 0)
+    assert lons.min() >= -5.001 and lons.max() <= 9.001
+
+
+@requires_real_ice6g
+def test_glaciated_cells_are_nan_on_the_real_files():
+    """Fennoscandia at 16.5 ka: ``sftgif > 0`` → NaN, not a ~+1700 m ice column."""
+    loader = _real_pair_loader()
+    try:
+        with pytest.warns(GiaDeltaHasIceSurfaceNaNWarning, match="ICE SURFACE"):
+            _lats, _lons, dz, _ice_h = loader.get_fields(
+                epoch_ka=REAL_EPOCH_KA, bounds=(10.0, 58.0, 30.0, 72.0)
+            )
+    finally:
+        loader.close()
+
+    assert np.isnan(dz).any(), "no NaN over an ice sheet — the guard is not wired in"
+    assert np.isfinite(dz).any(), "the whole window is NaN — the guard is too greedy"
+    assert float(np.nanmax(np.abs(dz))) < 500.0, (
+        "an ice-column magnitude survived into Δz_solid"
+    )
+
+
+@requires_real_ice6g
+def test_epoch_mismatch_between_request_and_file_is_refused():
+    """Asking a 16.5 ka pair for 21 ka must raise, not answer with the wrong epoch."""
+    loader = _real_pair_loader()
+    try:
+        with pytest.raises(ValueError, match="(?i)epoch"):
+            loader.get_fields(epoch_ka=21, bounds=MANYCH_BOUNDS)
+    finally:
+        loader.close()
+
+
+@requires_real_ice6g
+def test_single_epoch_file_alone_refuses_with_guidance():
+    """One file cannot make a delta.  The refusal must name the epoch-pair API."""
+    loader = Ice6gLoader(_REAL_FILES[0])
+    try:
+        with pytest.raises(ValueError) as exc:
+            loader.get_fields(epoch_ka=REAL_EPOCH_KA, bounds=MANYCH_BOUNDS)
+    finally:
+        loader.close()
+    msg = str(exc.value)
+    assert "from_epoch_files" in msg or "from_epoch_directory" in msg, (
+        f"the refusal must point at the epoch-pair API; got: {msg}"
+    )
+
+
+def test_epoch_filename_convention():
+    """Integers bare, half-ka to one decimal — the shipped naming, exactly."""
+    assert ice6g_epoch_filename(16) == "I6_C.VM5a_10min.16.nc"
+    assert ice6g_epoch_filename(16.0) == "I6_C.VM5a_10min.16.nc"
+    assert ice6g_epoch_filename(16.5) == "I6_C.VM5a_10min.16.5.nc"
+    assert ice6g_epoch_filename(0) == "I6_C.VM5a_10min.0.nc"
+    assert ice6g_epoch_filename(0.5) == "I6_C.VM5a_10min.0.5.nc"
+
+
+def test_missing_epoch_file_raises_naming_the_path(tmp_path):
+    """A missing epoch must fail at construction with the path, not later."""
+    with pytest.raises(FileNotFoundError, match="I6_C.VM5a_10min.16.5.nc"):
+        Ice6gLoader.from_epoch_directory(tmp_path, 16.5, reference_ka=0.0)
+
+
+# ===========================================================================
+# The 43-epoch fixture must keep loading through the time axis
+# ===========================================================================
+
+
+def test_multi_epoch_fixture_still_loads(ice6g_path):
+    """``tests/fixtures/ice6g/ICE6G_fixture.nc`` — 43 epochs on a ``time`` axis.
+
+    It is a *regional* cut (57–68 °N, 1–12 °E), so it holds no far-field tropical
+    land and the datum cannot be derived from it — that refusal is correct and is
+    pinned in ``tests/test_gia.py``.  Here it is supplied explicitly, which is the
+    documented escape hatch, so that the **time-axis path itself** stays covered.
+    """
+    if not ice6g_path.exists():
+        pytest.skip("ICE-6G fixture file not found")
+
+    with xr.open_dataset(ice6g_path) as ds:
+        assert ds.sizes["time"] == 43
+
+    loader = Ice6gLoader(ice6g_path)
+    try:
+        with pytest.warns(GiaDeltaHasIceSurfaceNaNWarning):
+            lats, lons, dz, ice_h = loader.get_fields(
+                epoch_ka=18,
+                bounds=(4.0, 59.0, 10.0, 65.0),
+                sea_surface_offset=81.958,   # measured once on the global 18 ka file
+            )
+    finally:
+        loader.close()
+
+    assert dz.shape == (lats.size, lons.size) == ice_h.shape
+    assert lats.size > 0 and lons.size > 0
+    assert np.isnan(dz).any(), "Scandinavia at 18 ka is glaciated; expected NaN"
+
+
+def test_multi_epoch_fixture_without_a_datum_still_refuses(ice6g_path):
+    """The regional cut must not improvise a datum just because the API grew."""
+    if not ice6g_path.exists():
+        pytest.skip("ICE-6G fixture file not found")
+
+    loader = Ice6gLoader(ice6g_path)
+    try:
+        with pytest.raises(ValueError, match="(?i)reference set|global"):
+            loader.get_fields(epoch_ka=18, bounds=(4.0, 59.0, 10.0, 65.0))
+    finally:
+        loader.close()
