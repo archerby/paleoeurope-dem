@@ -66,6 +66,20 @@ PALEOCOASTLINES_SHP = Path(
     r"D:\pasha\RESEARCH\Paleo-Europe_3D\data\raw\paleocostline"
     r"\Paleocoastlines\Paleocoastlines\Paleocoastlines.shp"
 )
+# STALE, FLAGGED 2026-07-31, DELIBERATELY NOT CHANGED HERE.  This file is NOT
+# Spratt & Lisiecki: it is a hand-drawn round-number sketch whose values appear
+# nowhere in the published stack (16 ka: -105 here vs -98.06 published; 10 ka:
+# -50 vs -24.59).  ``bake_black_sea.SPRATT_CSV`` was re-pointed at the genuine
+# transcription, ``spratt_lisiecki_2016_full.csv`` (NOAA/WDS-Paleo study 19982),
+# on 2026-07-31; this script was not.
+#
+# Why it is left alone: this curve only drives the LEFT-HAND, DELIBERATELY-WRONG
+# comparison panel, nothing downstream of the bake consumes it, and swapping the
+# file is not a one-line change — the published stack reads +8.49 m at 0 ka and
+# ``bake_black_sea.eustatic_level_m`` subtracts that datum, whereas this script
+# calls ``get_sea_level_for_epoch()`` raw.  Re-pointing it without also deciding
+# where the re-referencing lives would put a NEW wrong number here.  Recorded in
+# the vertical-datum contract's 2026-07-31 provenance section as a known gap.
 SPRATT_CSV = Path(
     r"D:\pasha\RESEARCH\renders\paleoeurope-dem"
     r"\data\sea_level_curves\spratt_lisiecki_2016_simplified.csv"
@@ -90,6 +104,31 @@ LAND_COLOR = "#6b8f3a"   # green
 SEA_COLOR = "#2a6db5"    # blue
 EDGE_COLOR = "#1d1d1d"
 BG_COLOR = "#cfe6f5"     # light water background (everything not land = sea/lake)
+
+
+def load_bs_curve(csv_path: Path = BLACK_SEA_CSV) -> pd.DataFrame:
+    """Read the Pontic level curve.
+
+    ``comment="#"`` is LOAD-BEARING, not tidiness.  The curve CSV carries a `#`
+    header block (datum annotation since 2026-07-30, marker-column
+    documentation since the same day, and it will grow).  Without the keyword
+    pandas takes the first `#` line as the header row and dies on the first
+    line that has more than one field::
+
+        pandas.errors.ParserError: Error tokenizing data.
+        C error: Expected 1 fields in line 6, saw 2
+
+    which is exactly what this script did between 2026-07-30 and the fix.
+    Pinned by ``tests/test_render_black_sea_corrected.py``.
+
+    NOTE ON FRAME: the values returned here are the RAW curve values, which are
+    **mixed-frame** (F2 pre-reconnection / F4 after) — see the vertical-datum
+    contract, ``Paleo-Europe_3D/docs/superpowers/research/
+    2026-07-30-vertical-datum-contract.md``.  This script drives a *vector*
+    coastline-step lookup, not a GIA-corrected DEM, so it needs no F2 -> F1
+    conversion; a DEM consumer does.
+    """
+    return pd.read_csv(csv_path, comment="#")
 
 
 def bs_level_for_epoch(bs_df: pd.DataFrame, epoch_ka: float) -> tuple[float, str]:
@@ -151,7 +190,7 @@ def main() -> None:
     )
 
     print(f"[2/4] Loading Black Sea curve CSV (column '{BS_COLUMN}'): {BLACK_SEA_CSV}")
-    bs_df = pd.read_csv(BLACK_SEA_CSV)
+    bs_df = load_bs_curve(BLACK_SEA_CSV)
 
     # ── Per-epoch sea levels + coastline steps ───────────────────────────────
     print("[3/4] Computing per-epoch global vs Pontic sea levels & coastline steps")

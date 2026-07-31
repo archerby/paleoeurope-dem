@@ -22,6 +22,30 @@ dramatically.  This script visualises that scientific correction.
 Because the whole scene is Black-Sea-proper water (one decoupled basin), a
 single basin level is valid for the entire frame.
 
+THE THRESHOLD IS NOT THE CURVE VALUE (vertical-datum contract, 2026-07-30)
+-------------------------------------------------------------------------
+``2026-06-21-black-sea-level-curve.csv`` is **mixed-frame**.  Rows older than each
+column's reconnection date (gradual > 9.0 ka, catastrophic > 7.15 ka) are **F2 —
+RSL as reported**: the *present-day measured depth* of a marker that stood at the
+water surface at time t.  An F2 number is not the elevation of a palaeo water
+surface in the present-day frame, so it cannot be compared with a GIA-corrected
+``H_paleo`` as-is.  The conversion is
+
+    T(t) = level(t) + Δz_solid(x_marker, t)          (F2 -> F1)
+
+and it is applied **at the threshold, never in the curve** — the level column is
+the cited literature value, and rewriting it would break
+:func:`validate_basin_curve`'s F2 semantics (contract §8).  See
+:func:`pontic_threshold`, which also states, per epoch and per scenario, WHICH of
+the three rules produced the number.
+
+Rows at or after the reconnection date are **F4 — global-mean sea level**, i.e.
+an *intended ocean* threshold.  For those the contract's §2 derivation gives the
+**exact** companion of this DEM: ``T(t) = -offset(t)``.  Exact, not approximate:
+whatever local sea-surface residual is baked into ``Δz_engine`` cancels against
+the same scalar.  The deliberately-WRONG comparison frames are the one place a
+eustatic curve survives, and that is the whole point of them — see ``main()``.
+
 PALEO-DEM
 ---------
 paleo_dem(t) = H_modern + Δz_solid(t)   (present-datum solid-earth displacement)
@@ -107,7 +131,9 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping
 
 # Make the package importable when run directly (repo is not pip-installed).
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -168,11 +194,60 @@ PONTIC_CSV = (
     / "research"
     / "2026-06-21-black-sea-level-curve.csv"
 )
-# Simplified curve: 0 ka -> 0 m (the full CSV has a +8.49 m present-datum offset
-# and must NOT be used for the global-eustatic reference frames).
-SPRATT_CSV = (
-    _RAW_DIR / "sea_level_curves" / "spratt_lisiecki_2016_simplified.csv"
-)
+# THE global-eustatic (F4) curve.  This is the PUBLISHED series and nothing else:
+# ``spratt_lisiecki_2016_full.csv`` is a bit-exact transcription of the
+# ``SeaLev_shortPC1`` + ``SeaLev_shortPC1_err_sig`` columns of the NOAA/WDS-Paleo
+# distribution ``spratt2016.txt`` (study 19982), i.e. the scaled first principal
+# component of the seven 0-430 ka reconstructions of
+#   Spratt, R. M. & Lisiecki, L. E. (2016). A Late Pleistocene sea level stack.
+#   Climate of the Past 12, 1079-1092.  doi:10.5194/cp-12-1079-2016
+# 0-30 ka at 1 ka steps.  Pinned row-by-row against the NOAA file by
+# tests/test_bake_black_sea.py::test_spratt_csv_is_bit_exact_with_the_noaa_shortpc1_column.
+#
+# WHAT THIS REPLACED, AND WHY IT MATTERS.  Two files named
+# ``spratt_lisiecki_2016_simplified.csv`` ship in this project (0-20 ka at 1 ka
+# under PALEO_DATA_ROOT, 0-26 ka at 0.5 ka in this repo).  NEITHER is Spratt &
+# Lisiecki: both are hand-drawn round-number curves whose values appear nowhere
+# in the published stack (16 ka: -105 m in the file vs -98.06 m published;
+# 10 ka: -50 m vs -24.59 m).  22 ka was not covered at all and got CLAMPED to the
+# 20 ka row.  This module's own docstring above quotes -98 m and -25 m — the
+# PUBLISHED numbers — so the data now matches the intent that was written down
+# all along.
+#
+# THE PRESENT DATUM IS NOT ZERO, AND IT IS NOW SUBTRACTED — decision taken by the
+# owner 2026-07-31, recorded here rather than inferred from the arithmetic.  The
+# published stack reads **+8.49 m at 0 ka** (1 sigma +/-5.23 m, so 0 m is well
+# inside its own uncertainty); the retired hand-drawn file passed through 0.00 m by
+# construction.  :func:`spratt_present_datum_m` still reports the PUBLISHED value;
+# :func:`eustatic_level_m` is the 0-referenced series, and it is what every frame
+# thresholded on this curve uses.
+#
+#   WHY SUBTRACT.  ``offset(t)`` is 0 at 0 ka by construction and the paleo-DEM is
+#   a PRESENT-DATUM surface (``H_paleo(x, 0) == H_modern(x)`` exactly), so an F4
+#   threshold laid on it must also be 0 at t = 0.  Left as published, the 0 ka and
+#   2 ka comparison frames render with sea level standing ABOVE the modern coast
+#   (+8.49 m and +4.49 m), which reads as a bug to every viewer and is not what the
+#   authors' Holocene scaling residual means.
+#
+#   WHAT IT COSTS, STATED PLAINLY.  This is a FRAMING decision, not a correction of
+#   the data: Spratt & Lisiecki scaled the stack against both Holocene and LGM
+#   estimates, so neither end is privileged and the residual is not an error to be
+#   removed.  Subtracting 8.49 m moves the 22 ka LGM frame from -125.82 m to
+#   **-134.31 m** (and the stack's own deepest node, 24 ka, from -130.00 to
+#   -138.49 m) — i.e. it buys agreement at t = 0 by pushing the glacial end 8.5 m
+#   deeper than the published curve.  ``2026-07-30-vertical-datum-contract.md`` §5b
+#   declined to make this call in passing; it is made here, on purpose, in one
+#   place, and it is pinned by
+#   ``test_eustatic_series_is_zero_referenced_to_present`` /
+#   ``test_zero_referencing_moves_the_lgm_frame_to_the_documented_value``.
+SPRATT_CSV = _RAW_DIR / "sea_level_curves" / "spratt_lisiecki_2016_full.csv"
+
+# Widest acceptable distance (years) between a requested epoch and the nearest row
+# of the eustatic curve.  ``get_sea_level_for_epoch`` is NEAREST-NEIGHBOUR, so this
+# IS the resolution of the lookup; 500 yr is half a step of the published 1 ka
+# series, i.e. "the epoch is genuinely bracketed".  Anything wider is either a
+# truncated curve (a clamp) or a curve too coarse to answer the question.
+SPRATT_MAX_NODE_GAP_YR = 500.0
 PALEOCOASTLINES_SHP = (
     _RAW_DIR
     / "paleocostline"
@@ -354,9 +429,114 @@ class UnknownGiaInBakeError(ValueError):
     """
 
 
+class SprattCoverageError(ValueError):
+    """The eustatic curve cannot answer for an epoch the bake is about to render.
+
+    ``get_sea_level_for_epoch`` is a NEAREST-NEIGHBOUR lookup that never fails: off
+    the end of a curve it returns the end row, and its own truncation warning only
+    fires above a 1000 yr miss.  A 0-20 ka curve asked for 21 ka therefore misses
+    by exactly 1000 yr and comes back CLAMPED, SILENTLY — which is how the bake
+    ran for months against a curve that stopped 2 ka short of its own oldest
+    epoch.  This check runs before the first frame and converts that silence into
+    a stop.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _spratt_ages_bp(csv_path: Path | None = None) -> np.ndarray:
+    """Ages (years BP) of the eustatic curve, ascending.  Raises if absent."""
+    csv_path = Path(csv_path) if csv_path is not None else SPRATT_CSV
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Sea-level CSV not found: {csv_path}")
+    df = pd.read_csv(
+        csv_path, comment="#", header=None,
+        names=["age_bp", "sea_level_m", "uncertainty_m"],
+    )
+    return np.sort(df["age_bp"].to_numpy(dtype=float))
+
+
+def spratt_present_datum_m(csv_path: Path | None = None) -> float:
+    """Value the eustatic curve takes at 0 ka **as published**, in metres.
+
+    Zero for a curve referenced to present; **+8.49 m** for the published Spratt &
+    Lisiecki ``shortPC1`` stack, whose Holocene scaling residual is inside its own
+    1 sigma (+/-5.23 m at 0 ka).  This function deliberately reports the RAW
+    published value and never the re-referenced one, so that the size of the
+    framing decision stays visible; :func:`eustatic_level_m` is what subtracts it.
+    """
+    csv_path = Path(csv_path) if csv_path is not None else SPRATT_CSV
+    return float(get_sea_level_for_epoch(0.0, csv_path))
+
+
+def eustatic_level_m(epoch: float, csv_path: Path | None = None) -> float:
+    """0-referenced global-mean (F4) sea level for *epoch*, in metres.
+
+    ``published(epoch) - published(0 ka)``.  This is THE eustatic number every
+    frame in this script thresholds on; nothing else may call
+    :func:`~paleoeurope.viz.paleocostline_render.get_sea_level_for_epoch` for a
+    threshold, because that returns the un-referenced published value and would
+    put sea level 8.49 m above the modern coast at t = 0.
+
+    Rationale, cost and provenance of the subtraction: see the ``SPRATT_CSV``
+    comment block.  Lookup is NEAREST-NEIGHBOUR on a 1 ka grid, so
+    :func:`check_spratt_coverage` must have passed first or the answer may be a
+    silent clamp.
+    """
+    csv_path = Path(csv_path) if csv_path is not None else SPRATT_CSV
+    published = float(get_sea_level_for_epoch(float(epoch), csv_path))
+    return published - spratt_present_datum_m(csv_path)
+
+
+def check_spratt_coverage(
+    epochs_ka,
+    csv_path: Path | None = None,
+    max_node_gap_yr: float = SPRATT_MAX_NODE_GAP_YR,
+) -> None:
+    """Raise unless every epoch is genuinely bracketed by the eustatic curve.
+
+    Two distinct failures, one exception:
+
+    * **clamping** — the epoch lies outside the curve's own age range, so the
+      nearest-neighbour lookup returns an endpoint that has nothing to do with it;
+    * **resolution** — the epoch is inside the range but the nearest row is more
+      than *max_node_gap_yr* away, so the "lookup" is really an unstated
+      extrapolation across a gap.
+
+    Raises
+    ------
+    SprattCoverageError
+        Listing every offending epoch, the nearest row, and the miss in years.
+    """
+    ages = _spratt_ages_bp(csv_path)
+    lo, hi = float(ages[0]), float(ages[-1])
+    problems: list[str] = []
+    for epoch in epochs_ka:
+        want = float(epoch) * 1000.0
+        nearest = float(ages[int(np.abs(ages - want).argmin())])
+        gap = abs(nearest - want)
+        if want < lo or want > hi:
+            problems.append(
+                f"{epoch} ka ({want:.0f} BP) is OUTSIDE the curve "
+                f"[{lo:.0f}, {hi:.0f}] BP — the lookup would clamp to "
+                f"{nearest:.0f} BP (miss {gap:.0f} yr)"
+            )
+        elif gap > max_node_gap_yr:
+            problems.append(
+                f"{epoch} ka ({want:.0f} BP) has no row within "
+                f"{max_node_gap_yr:.0f} yr — nearest is {nearest:.0f} BP "
+                f"(miss {gap:.0f} yr)"
+            )
+    if problems:
+        raise SprattCoverageError(
+            "eustatic curve "
+            f"{Path(csv_path) if csv_path is not None else SPRATT_CSV} "
+            "cannot answer for every requested epoch:\n  "
+            + "\n  ".join(problems)
+        )
 
 
 def _epoch_filename(epoch: float) -> str:
@@ -612,6 +792,469 @@ def pontic_level(df: pd.DataFrame, epoch: float, scenario: str = "gradual") -> f
     return basin_level(df, epoch, scenario, basin="pontic")
 
 
+# ---------------------------------------------------------------------------
+# F2 -> F1: the threshold conversion  T(t) = level(t) + Δz_solid(x_marker, t)
+# ---------------------------------------------------------------------------
+
+#: The three rules that may produce a closed-basin threshold, most exact first.
+#: A row that matches NONE of them raises :class:`UnconvertibleThresholdError`;
+#: there is deliberately no fourth, "use the nearest marker we happen to have"
+#: rule, because that substitution is what the 2026-07-30 audit measured as
+#: systematically one-signed (see :func:`pontic_threshold`).
+#:
+#:   ``marker``        the ROW's own located marker.  Exact.
+#:   ``locus``         no marker, but a DOCUMENTED region the level must have come
+#:                     from; median Δz over it, with its p5-p95 spread carried into
+#:                     the frame's own error bar.
+#:   ``ocean_offset``  the row is F4 (the basin has reconnected and IS the ocean),
+#:                     so the exact companion of this DEM is ``-offset(t)``.
+THRESHOLD_RULES: tuple[str, ...] = ("marker", "locus", "ocean_offset")
+
+#: Datum-sanity window for a CONVERTED threshold, in metres.  Wider and different
+#: from ``_DATUM_SANITY_RANGE_M['pontic']`` (-150..+1) on purpose: that window
+#: bounds an F2 *level*, which never rises above present sea level, while a
+#: converted threshold legitimately can — ``-offset(t)`` is +2.3 m at 5 ka
+#: (ICE-6G's far-field mid-Holocene highstand) and the F2 rows gain +10..+19 m.
+#: Blow-up / unit guard only.
+_THRESHOLD_SANITY_RANGE_M: tuple[float, float] = (-200.0, 60.0)
+
+
+class UnconvertibleThresholdError(ValueError):
+    """This row's F2 level cannot be put into the DEM's frame, and will not be faked.
+
+    Raised when the curve row has **no located marker** and **no documented
+    locus** — i.e. neither :data:`THRESHOLD_RULES` ``"marker"`` nor ``"locus"``
+    applies and the row is not F4.  Today that is the 10.0 / 9.5 ka pair (whose
+    two scenario columns diverge onto *different* unlocated markers: Giosan's
+    Danube-delta separation surface with no printed coordinates against
+    Lericolais's -100 m dune/terrace with no published shoreline position) and the
+    catastrophic column at 9.0 / 7.5 ka, which carries the same -100 m marker.
+
+    The tempting repair — reuse the Bosphorus cell — is exactly the substitution
+    the 2026-07-30 marker audit rejected: that cell sits low in the basin's Δz
+    field, so it is systematically ONE-SIGNED and OVER-FLOODS every row it is
+    borrowed for (~5.5 m at 22/18 ka, 3.9 m at 10.9 ka).  Resolve it by giving the
+    row a marker (``marker_lon``/``marker_lat`` in the curve CSV) or by citing a
+    locus and adding it to :data:`_LOCI` / :data:`_MARKER_SOURCE_LOCI`.
+    """
+
+
+@dataclass(frozen=True)
+class _Locus:
+    """A documented region a levelless F2 row could have been measured in."""
+
+    name: str
+    lon_deg: tuple[float, float]
+    lat_deg: tuple[float, float]
+    modern_depth_m: tuple[float, float]
+    why: str
+
+
+#: Loci that the curve CSV's own header block documents, verbatim.  Depth bands are
+#: read from ICE-6G ``Topo`` at 0 ka on the SAME 10-arcmin grid the Δz field lives
+#: on, so the band and the sample never come from different rasters.  Bounds are
+#: INCLUSIVE; that is the definition of record for these numbers.
+_LOCI: dict[str, _Locus] = {
+    "nw_outer_shelf_seismic_wedge": _Locus(
+        name="nw_outer_shelf_seismic_wedge",
+        lon_deg=(28.0, 33.0),
+        lat_deg=(43.0, 46.0),
+        modern_depth_m=(-130.0, -90.0),
+        why=(
+            "the NW outer shelf, where the LGM lowstand wedge / forced-regression "
+            "tract the -118..-120 m rows are compiled from actually sits "
+            "(Aksu2002b; Kaplin_Selivanov2004; Lericolais2009; Popescu2004; "
+            "Ryan1997 - a five-study seismic compilation, no single site)"
+        ),
+    ),
+    "basin_shelf_band": _Locus(
+        name="basin_shelf_band",
+        lon_deg=(27.0, 42.0),
+        lat_deg=(40.0, 48.0),
+        modern_depth_m=(-130.0, -20.0),
+        why=(
+            "the whole Black-Sea-proper shelf band, i.e. the depths across which "
+            "the shoreline actually moves; the honest locus for a row that is "
+            "interpolated on a DERIVED falling limb and names no site at all"
+        ),
+    ),
+}
+
+#: ``marker_source`` prefix -> locus.  Keyed on the prefix (not the epoch) so the
+#: mapping is a statement about the KIND of provenance, and a re-run of
+#: ``_build_bs_curve.py`` that renumbers rows cannot silently repoint it.
+#: Anything not listed here has no documented locus and RAISES.
+_MARKER_SOURCE_LOCI: tuple[tuple[str, str], ...] = (
+    ("UNKNOWN:seismic_lowstand_wedge", "nw_outer_shelf_seismic_wedge"),
+    ("UNKNOWN:interpolated_on_the_DERIVED_falling_limb", "basin_shelf_band"),
+    ("UNKNOWN:DERIVED_anchor_source_gives_no_absolute_level", "basin_shelf_band"),
+)
+
+#: Curve columns the conversion needs.  Added to the CSV 2026-07-30; a curve
+#: without them cannot be converted at all and must say so rather than guess.
+_MARKER_COLUMNS = ("marker_lon", "marker_lat", "marker_source")
+
+#: Literal strings the curve uses where a marker does not exist.  ``NOT_APPLICABLE``
+#: is spelled out because pandas coerces ``"NA"`` to NaN.
+_MARKER_UNKNOWN = "UNKNOWN"
+_MARKER_NOT_APPLICABLE = "NOT_APPLICABLE"
+
+
+@dataclass(frozen=True)
+class BasinThreshold:
+    """One frame's land/sea threshold, with the rule that produced it.
+
+    ``threshold_m`` is what goes into ``sea_level_override_m``.  Everything else
+    exists so that a caller — a log line, a raster tag, a reader — can see WHICH of
+    :data:`THRESHOLD_RULES` applied and how wide the resulting bar is.
+    """
+
+    epoch_ka: float
+    scenario: str
+    basin: str
+    level_m: float
+    frame: str
+    rule: str
+    threshold_m: float
+    conversion_m: float | None
+    bracket_m: tuple[float, float] | None
+    n_cells: int | None
+    marker_source: str
+    provenance: str
+
+
+def _window_solid_displacement(epoch: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """(Δz, modern Topo, lats, lons) over the BS window, RAW 10-arcmin cells.
+
+    Deliberately **unsmoothed**, unlike the field that reaches the raster
+    (``GIA_SIGMA_BLUR`` = 2.0 cells).  A marker is a point measurement: blurring a
+    single-cell probe over ~5 neighbouring cells would mix in ground the cited
+    marker does not describe.  Raw cells are also the protocol the 2026-07-30
+    contract and the curve CSV's header table were measured under, so the numbers
+    here are directly comparable with both (16.5 ka: offset 77.906 m,
+    Δz@Bosphorus 11.979 m).  The residual inconsistency — a σ=2 raster compared
+    against an unsmoothed threshold — is sub-metre over this window and is stated
+    rather than hidden.
+    """
+    win = _open_bs_window(epoch)
+    dz = solid_displacement(
+        win.topo_t,
+        win.topo_0,
+        win.offset,
+        sftgif_t=win.sftgif_t,
+        sftgif_0=win.sftgif_0,
+    )
+    return dz, win.topo_0, win.lats, win.lons
+
+
+def _cell_index(lats: np.ndarray, lons: np.ndarray, lon: float, lat: float) -> tuple[int, int]:
+    """Nearest grid cell to (*lon*, *lat*), refusing a point outside the window."""
+    if not (float(np.min(lats)) <= lat <= float(np.max(lats))):
+        raise UnconvertibleThresholdError(
+            f"marker latitude {lat:.4f} N is outside the ICE-6G window "
+            f"{float(np.min(lats)):.4f}..{float(np.max(lats)):.4f} N — the Δz there "
+            "was never read, and the nearest edge cell is a different place"
+        )
+    lon_wrapped = ((np.asarray(lons, dtype=float) - lon + 180.0) % 360.0) - 180.0
+    if float(np.abs(lon_wrapped).min()) > 1.0:
+        raise UnconvertibleThresholdError(
+            f"marker longitude {lon:.4f} E is outside the ICE-6G window "
+            f"{float(np.min(lons)):.4f}..{float(np.max(lons)):.4f} E"
+        )
+    return int(np.abs(np.asarray(lats, dtype=float) - lat).argmin()), int(
+        np.abs(lon_wrapped).argmin()
+    )
+
+
+def marker_solid_displacement(
+    epoch: float, lon: float, lat: float
+) -> tuple[float, tuple[float, float]]:
+    """``(Δz at the marker cell, 3x3 cell-block min/max)`` in metres.
+
+    The block is the honest local spread of a point probe on a 10-arcmin grid —
+    NOT a literature uncertainty on the marker's depth, which this module has no
+    access to.
+    """
+    dz, _topo0, lats, lons = _window_solid_displacement(epoch)
+    i, j = _cell_index(lats, lons, lon, lat)
+    value = float(dz[i, j])
+    if not np.isfinite(value):
+        raise UnconvertibleThresholdError(
+            f"Δz at the marker cell {lon:.4f}E/{lat:.4f}N is not finite at "
+            f"{epoch:g} ka — ICE-6G 'Topo' is the ice surface there and these files "
+            "carry no bedrock-under-ice field, so the conversion term is UNKNOWN"
+        )
+    block = dz[
+        max(i - 1, 0) : i + 2,
+        max(j - 1, 0) : j + 2,
+    ]
+    finite = block[np.isfinite(block)]
+    return value, (float(finite.min()), float(finite.max()))
+
+
+def locus_solid_displacement(
+    epoch: float, locus_name: str
+) -> tuple[float, tuple[float, float], int]:
+    """``(median Δz, (p5, p95), n_cells)`` over a documented locus, in metres."""
+    if locus_name not in _LOCI:
+        raise ValueError(f"unknown locus {locus_name!r}; known={sorted(_LOCI)}")
+    locus = _LOCI[locus_name]
+    dz, topo_0, lats, lons = _window_solid_displacement(epoch)
+    lat2d, lon2d = np.meshgrid(lats, lons, indexing="ij")
+    lon_wrapped = ((lon2d + 180.0) % 360.0) - 180.0
+    lo_d, hi_d = locus.modern_depth_m
+    mask = (
+        (lon_wrapped >= locus.lon_deg[0])
+        & (lon_wrapped <= locus.lon_deg[1])
+        & (lat2d >= locus.lat_deg[0])
+        & (lat2d <= locus.lat_deg[1])
+        & (topo_0 >= lo_d)
+        & (topo_0 <= hi_d)
+        & np.isfinite(dz)
+    )
+    values = dz[mask]
+    if values.size < 5:
+        raise UnconvertibleThresholdError(
+            f"locus {locus_name!r} contains only {values.size} usable ICE-6G cells "
+            f"at {epoch:g} ka — too few for a median and a p5-p95 bar, so there is "
+            "no defensible conversion term for this row"
+        )
+    return (
+        float(np.median(values)),
+        (float(np.percentile(values, 5)), float(np.percentile(values, 95))),
+        int(values.size),
+    )
+
+
+def _marker_source_for_scenario(raw: str, scenario: str) -> str:
+    """Resolve a possibly per-column ``marker_source`` down to one token.
+
+    ``MIXED:gradual=...;catastrophic=...`` exists because at 9.0 / 7.5 ka the
+    gradual column has already reconnected (F4) while the catastrophic column is
+    still a deep F2 lake.  A per-ROW answer would be wrong for one of them.
+    """
+    token = str(raw).strip()
+    if not token.startswith("MIXED:"):
+        return token
+    parts = {}
+    for chunk in token[len("MIXED:") :].split(";"):
+        key, sep, value = chunk.partition("=")
+        if sep:
+            parts[key.strip()] = value.strip()
+    if scenario not in parts:
+        raise UnconvertibleThresholdError(
+            f"marker_source {raw!r} is MIXED but names no entry for scenario "
+            f"{scenario!r} (has {sorted(parts)}) — the frame of this column is "
+            "undetermined and must not be guessed"
+        )
+    return parts[scenario]
+
+
+def _parse_marker_position(row, scenario: str) -> tuple[float, float] | None:
+    """``(lon, lat)`` if this row carries a located marker, else ``None``.
+
+    The curve stores the literal strings ``UNKNOWN`` / ``NOT_APPLICABLE`` where no
+    marker exists; those are branched on, never coerced.  A row with only one of
+    the two coordinates is a data error, not a half-known marker, and raises.
+    """
+    raw_lon, raw_lat = str(row["marker_lon"]).strip(), str(row["marker_lat"]).strip()
+    parsed = []
+    for raw in (raw_lon, raw_lat):
+        if raw in (_MARKER_UNKNOWN, _MARKER_NOT_APPLICABLE) or raw.startswith(
+            (_MARKER_UNKNOWN + ":", _MARKER_NOT_APPLICABLE + ":")
+        ):
+            parsed.append(None)
+            continue
+        try:
+            parsed.append(float(raw))
+        except ValueError:
+            parsed.append(None)
+    lon, lat = parsed
+    if (lon is None) != (lat is None):
+        raise UnconvertibleThresholdError(
+            f"curve row carries marker_lon={raw_lon!r} and marker_lat={raw_lat!r} — "
+            "half a coordinate pair is a data error, not a located marker"
+        )
+    return None if lon is None else (lon, lat)
+
+
+def _locus_for_marker_source(token: str) -> str | None:
+    for prefix, locus_name in _MARKER_SOURCE_LOCI:
+        if token.startswith(prefix):
+            return locus_name
+    return None
+
+
+def _check_threshold_sanity(value: float, where: str) -> float:
+    lo, hi = _THRESHOLD_SANITY_RANGE_M
+    if not np.isfinite(value):
+        raise UnconvertibleThresholdError(
+            f"converted threshold at {where} is not finite — the conversion term is "
+            "unknown and must not be written as a number"
+        )
+    if not lo <= value <= hi:
+        raise ValueError(
+            f"converted threshold {value:+.2f} m at {where} is outside the "
+            f"sanity window {lo:+.1f}..{hi:+.1f} m — datum or unit blow-up"
+        )
+    return float(value)
+
+
+def pontic_threshold(
+    df: pd.DataFrame, epoch: float, scenario: str = "gradual"
+) -> BasinThreshold:
+    """Land/sea threshold for one Pontic frame, in the paleo-DEM's own frame.
+
+    This is the code the 2026-07-30 vertical-datum contract asks for and that had,
+    until now, existed only as prose.  The bake used to pass the raw CSV level
+    straight through, which is the contract's §8 row *"re-bake the DEM without
+    §5a's threshold change -> hero frames over-corrected ~12 m"*.
+
+    THE CONVERSION.  For an **F2** row (RSL as reported — the present-day measured
+    depth of a marker that stood at the water surface at time t)::
+
+        T(t) = level(t) + Δz_solid(x_marker, t)
+
+    applied HERE, at the threshold, and never in the curve: the level column is the
+    cited literature value, and rewriting it would silently break
+    :func:`validate_basin_curve`'s F2 anchor/mirror semantics (contract §8).
+
+    For an **F4** row (the basin has reconnected and *is* the ocean, so the level is
+    a global mean, not a local water surface) the CSV value is not used as the
+    threshold at all: the exact companion of this DEM is ``-offset(t)``
+    (:func:`sea_surface_offset`, contract §2).
+
+    WHICH RULE APPLIED, AND WHY IT MATTERS.  Only 2 of the curve's 57 rows carry a
+    located marker; 35 are the literal string ``UNKNOWN``.  Three rules, in
+    decreasing exactness — ``marker``, ``locus``, ``ocean_offset`` — and every
+    result reports its own in ``rule`` and in ``provenance``.  A row that matches
+    none of them raises :class:`UnconvertibleThresholdError` rather than borrowing
+    somebody else's marker.  That refusal is the point: the audit measured the
+    obvious fallback (the Bosphorus cell) as systematically ONE-SIGNED — it sits
+    low in the basin's Δz field, so it OVER-FLOODS every row it is borrowed for, by
+    ~5.5 m at 22/18 ka and ~3.9 m at 10.9 ka.  Re-introducing it silently would
+    undo the entire phase this function exists to close.
+
+    Raises
+    ------
+    UnconvertibleThresholdError
+        No marker and no documented locus (today: 10.0 and 9.5 ka in both columns,
+        and the catastrophic column at 9.0 and 7.5 ka).
+    ValueError
+        Unknown scenario, a curve without the marker columns, or a converted
+        threshold outside :data:`_THRESHOLD_SANITY_RANGE_M`.
+    """
+    col = f"level_m_global_{scenario}"
+    if col not in df.columns:
+        raise ValueError(
+            f"unknown scenario {scenario!r}; available columns={list(df.columns)}"
+        )
+    missing = [c for c in _MARKER_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"curve is missing {missing} — without the marker columns an F2 level "
+            "cannot be converted into the DEM's frame at all.  Regenerate the CSV "
+            "with _build_bs_curve.py (they were added 2026-07-30); do NOT fall back "
+            "on a basin-wide constant."
+        )
+
+    idx = (df["age_ka"] - float(epoch)).abs().idxmin()
+    row = df.loc[idx]
+    level = pontic_level(df, epoch, scenario)
+    where = f"{float(epoch):g} ka / {scenario}"
+    token = _marker_source_for_scenario(row["marker_source"], scenario)
+
+    # --- F4: the basin IS the ocean here; use the DEM's exact companion --------
+    if token.startswith(_MARKER_NOT_APPLICABLE):
+        offset = sea_surface_offset(epoch)
+        # ``+ 0.0`` normalises the -0.0 that ``-offset`` gives at 0 ka.
+        threshold = _check_threshold_sanity(-offset + 0.0, where)
+        return BasinThreshold(
+            epoch_ka=float(epoch),
+            scenario=scenario,
+            basin="pontic",
+            level_m=level,
+            frame="F4",
+            rule="ocean_offset",
+            threshold_m=threshold,
+            conversion_m=None,
+            bracket_m=None,
+            n_cells=None,
+            marker_source=token,
+            provenance=(
+                f"rule=ocean_offset frame=F4 {where}: reconnected basin, "
+                f"T = -offset(t) = {threshold:+.3f} m (exact, contract sec.2).  The CSV "
+                f"level {level:+.2f} m is a GLOBAL MEAN and is NOT used as the "
+                "threshold."
+            ),
+        )
+
+    # --- F2 rule 1: the row's own located marker.  Exact. ---------------------
+    position = _parse_marker_position(row, scenario)
+    if position is not None:
+        lon, lat = position
+        dz, block = marker_solid_displacement(epoch, lon, lat)
+        threshold = _check_threshold_sanity(level + dz, where)
+        return BasinThreshold(
+            epoch_ka=float(epoch),
+            scenario=scenario,
+            basin="pontic",
+            level_m=level,
+            frame="F2",
+            rule="marker",
+            threshold_m=threshold,
+            conversion_m=float(dz),
+            bracket_m=(level + block[0], level + block[1]),
+            n_cells=None,
+            marker_source=token,
+            provenance=(
+                f"rule=marker frame=F2 {where}: T = level({level:+.2f} m) + "
+                f"dz({dz:+.3f} m) @ {lon:.4f}E/{lat:.4f}N = {threshold:+.3f} m "
+                f"[3x3 cell spread {level + block[0]:+.3f}..{level + block[1]:+.3f} m]"
+                f" ({token})"
+            ),
+        )
+
+    # --- F2 rule 2: no marker, but a DOCUMENTED locus + its p5-p95 bar --------
+    locus_name = _locus_for_marker_source(token)
+    if locus_name is not None:
+        median, (p5, p95), n_cells = locus_solid_displacement(epoch, locus_name)
+        threshold = _check_threshold_sanity(level + median, where)
+        return BasinThreshold(
+            epoch_ka=float(epoch),
+            scenario=scenario,
+            basin="pontic",
+            level_m=level,
+            frame="F2",
+            rule="locus",
+            threshold_m=threshold,
+            conversion_m=float(median),
+            bracket_m=(level + p5, level + p95),
+            n_cells=n_cells,
+            marker_source=token,
+            provenance=(
+                f"rule=locus frame=F2 {where}: T = level({level:+.2f} m) + "
+                f"dz({median:+.3f} m, median over locus {locus_name!r}, "
+                f"{n_cells} cells) = {threshold:+.3f} m "
+                f"[p5-p95 {level + p5:+.3f}..{level + p95:+.3f} m] - "
+                f"{_LOCI[locus_name].why}"
+            ),
+        )
+
+    # --- F2 rule 3: neither.  Refuse. ----------------------------------------
+    raise UnconvertibleThresholdError(
+        f"{where}: the curve row has NO located marker (marker_source={token!r}) and "
+        f"no documented locus in _MARKER_SOURCE_LOCI, so the F2 level "
+        f"{level:+.2f} m cannot be put into the paleo-DEM's frame.  It is NOT "
+        "converted with the Bosphorus cell or any other row's marker: that "
+        "substitution is systematically one-signed (it sits low in the basin's Δz "
+        "field and OVER-FLOODS, by ~5.5 m at 22/18 ka), which is the defect this "
+        "conversion exists to remove.  Fix it by adding marker_lon/marker_lat to "
+        "the curve row, or by citing a locus and registering it in _LOCI / "
+        "_MARKER_SOURCE_LOCI."
+    )
+
+
 def _icemask_subset(ds_sub) -> np.ndarray | None:
     """``sftgif`` (percent) from an already-subset ICE-6G dataset, or ``None``.
 
@@ -622,6 +1265,75 @@ def _icemask_subset(ds_sub) -> np.ndarray | None:
     if ICE6G_ICEMASK_VAR not in ds_sub.variables:
         return None
     return ds_sub[ICE6G_ICEMASK_VAR].values.astype(np.float64)
+
+
+@dataclass(frozen=True)
+class _BsWindow:
+    """Raw ICE-6G fields for one epoch: global datum + the regional subset."""
+
+    epoch_ka: float
+    file_t: Path
+    file_0: Path
+    offset: float
+    topo_t: np.ndarray
+    topo_0: np.ndarray
+    lats: np.ndarray
+    lons: np.ndarray
+    sftgif_t: np.ndarray | None
+    sftgif_0: np.ndarray | None
+
+
+def _open_bs_window(epoch: float) -> _BsWindow:
+    """Read the epoch/0-ka ICE-6G pair once: GLOBAL datum, REGIONAL fields.
+
+    Shared by :func:`gia_delta_subset` (which turns it into Δz for the bake) and by
+    :func:`pontic_threshold` (which samples Δz at a marker or over a locus).  One
+    reader means the threshold cannot silently drift onto a different datum,
+    window or grid from the raster it is compared against.
+    """
+    f_t = ICE6G_DIR / _epoch_filename(epoch)
+    f_0 = ICE6G_DIR / _epoch_filename(0)
+    lat_lo, lat_hi = LAT_MIN - BUF, LAT_MAX + BUF
+    lon_lo, lon_hi = LON_MIN - BUF, LON_MAX + BUF
+
+    with xr.open_dataset(f_t) as ds_t, xr.open_dataset(f_0) as ds_0:
+        # Sea-surface datum: GLOBAL field, deliberately not the subset below.
+        offset = implied_sea_surface_offset(
+            ds_t["Topo"].values.astype(np.float64),
+            ds_0["Topo"].values.astype(np.float64),
+        )
+        sub_t = ds_t.sel(lat=slice(lat_lo, lat_hi), lon=slice(lon_lo, lon_hi))
+        sub_0 = ds_0.sel(lat=slice(lat_lo, lat_hi), lon=slice(lon_lo, lon_hi))
+        return _BsWindow(
+            epoch_ka=float(epoch),
+            file_t=f_t,
+            file_0=f_0,
+            offset=float(offset),
+            topo_t=sub_t["Topo"].values.astype(np.float64),
+            topo_0=sub_0["Topo"].values.astype(np.float64),
+            lats=sub_t["lat"].values.astype(np.float64),
+            lons=sub_t["lon"].values.astype(np.float64),
+            sftgif_t=_icemask_subset(sub_t),
+            sftgif_0=_icemask_subset(sub_0),
+        )
+
+
+def sea_surface_offset(epoch: float) -> float:
+    """``offset(t)`` in metres — the sea-surface datum this DEM is built on.
+
+    Median ``ΔTopo`` over far-field ice-free tropical continental land, from the
+    **global** ICE-6G field (see :func:`gia_delta_subset` for why the global field
+    and not a regional cut).  ``0.0`` at 0 ka by construction.
+
+    Its negation ``-offset(t)`` is the **exact** land/sea companion of
+    ``H_paleo`` for any cell ICE-6G treats as ocean — contract §2:
+
+        ``submerged  <=>  H_paleo < -offset(t)``
+
+    Exact, with no uniformity assumption: whatever local sea-surface residual is
+    baked into ``Δz_engine`` cancels against the same scalar on the other side.
+    """
+    return _open_bs_window(epoch).offset
 
 
 def gia_delta_subset(
@@ -666,25 +1378,14 @@ def gia_delta_subset(
         not explain (a stray ``_FillValue`` in ``Topo`` must not masquerade as an
         ice hole).
     """
-    f_t = ICE6G_DIR / _epoch_filename(epoch)
-    f_0 = ICE6G_DIR / _epoch_filename(0)
+    win = _open_bs_window(epoch)
+    f_t, f_0 = win.file_t, win.file_0
     lat_lo, lat_hi = LAT_MIN - BUF, LAT_MAX + BUF
     lon_lo, lon_hi = LON_MIN - BUF, LON_MAX + BUF
-
-    with xr.open_dataset(f_t) as ds_t, xr.open_dataset(f_0) as ds_0:
-        # Sea-surface datum: GLOBAL field, deliberately not the subset below.
-        offset = implied_sea_surface_offset(
-            ds_t["Topo"].values.astype(np.float64),
-            ds_0["Topo"].values.astype(np.float64),
-        )
-        sub_t = ds_t.sel(lat=slice(lat_lo, lat_hi), lon=slice(lon_lo, lon_hi))
-        sub_0 = ds_0.sel(lat=slice(lat_lo, lat_hi), lon=slice(lon_lo, lon_hi))
-        topo_t = sub_t["Topo"].values.astype(np.float64)
-        topo_0 = sub_0["Topo"].values.astype(np.float64)
-        model_lats = sub_t["lat"].values.astype(np.float64)
-        model_lons = sub_t["lon"].values.astype(np.float64)
-        sftgif_t = _icemask_subset(sub_t)
-        sftgif_0 = _icemask_subset(sub_0)
+    offset = win.offset
+    topo_t, topo_0 = win.topo_t, win.topo_0
+    model_lats, model_lons = win.lats, win.lons
+    sftgif_t, sftgif_0 = win.sftgif_t, win.sftgif_0
 
     if sftgif_t is None and sftgif_0 is None and require_ice_information:
         raise ValueError(
@@ -760,7 +1461,10 @@ def _require_model_grid_brackets_tile(
 
 
 def build_paleo_dem(
-    epoch: float, *, gia_nan_policy: str = BAKE_GIA_NAN_POLICY
+    epoch: float,
+    *,
+    gia_nan_policy: str = BAKE_GIA_NAN_POLICY,
+    provenance: Mapping[str, str] | None = None,
 ) -> Path:
     """Bake the GIA-corrected paleo-DEM GeoTIFF for *epoch*; return its path.
 
@@ -770,6 +1474,12 @@ def build_paleo_dem(
         What to do when the GIA correction is unknown over part of the window
         because ICE-6G ``Topo`` is the ice surface there.  See
         :data:`BAKE_GIA_NAN_POLICIES`.  There is no ``'zero'``.
+    provenance : mapping, optional
+        Free-form GDAL metadata tags written into the raster header.  ``main()``
+        uses it to record, in the raster itself, every threshold this epoch is
+        rendered at, which of :data:`THRESHOLD_RULES` produced it and how wide its
+        bar is — so a .tif that outlives this run still says what frame it belongs
+        to.  Keys/values are stringified; nothing here is read back by the bake.
 
     Raises
     ------
@@ -896,6 +1606,19 @@ def build_paleo_dem(
     }
     with rasterio.open(out_tif, "w", **profile) as dst:
         dst.write(paleo_dem.astype(np.float32), 1)
+        dst.update_tags(
+            epoch_ka=f"{float(epoch):g}",
+            gia_model="ICE-6G_C VM5a 10min",
+            gia_datum="implied_sea_surface_offset (far-field ice-free tropical land)",
+            gia_sea_surface_offset_m=f"{sea_surface_offset(epoch):.6f}",
+            gia_nan_policy=gia_nan_policy,
+            vertical_frame="F0 present-day datum (H_modern + dz_solid)",
+            vertical_datum_contract=(
+                "Paleo-Europe_3D/docs/superpowers/research/"
+                "2026-07-30-vertical-datum-contract.md"
+            ),
+            **{str(k): str(v) for k, v in (provenance or {}).items()},
+        )
 
     return out_tif
 
@@ -905,12 +1628,87 @@ def build_paleo_dem(
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
+def preflight_thresholds(
+    pontic_df: pd.DataFrame,
+    epochs=None,
+    scenarios=SCENARIOS,
+) -> tuple[dict[tuple[float, str], BasinThreshold], dict[tuple[float, str], str]]:
+    """Resolve every frame's threshold BEFORE a single raster is written.
+
+    Returns ``(resolved, unconvertible)``.  Doing this up front is the same
+    discipline as :func:`check_spratt_coverage`: a frame that cannot be put into
+    the DEM's vertical frame must be discovered before the run half-fills an
+    output tree, not on epoch 7 of 13.
+    """
+    epochs = EPOCHS_KA if epochs is None else epochs
+    resolved: dict[tuple[float, str], BasinThreshold] = {}
+    unconvertible: dict[tuple[float, str], str] = {}
+    for epoch in epochs:
+        for scenario in scenarios:
+            try:
+                resolved[(epoch, scenario)] = pontic_threshold(
+                    pontic_df, epoch, scenario
+                )
+            except UnconvertibleThresholdError as exc:
+                unconvertible[(epoch, scenario)] = str(exc)
+    return resolved, unconvertible
+
+
+def main(*, skip_unconvertible: bool = False) -> None:
+    """Bake the 13 epochs.
+
+    Parameters
+    ----------
+    skip_unconvertible : bool
+        What to do about a frame whose F2 level cannot be converted into the
+        paleo-DEM's vertical frame (no marker, no documented locus — see
+        :class:`UnconvertibleThresholdError`).  ``False`` (default) aborts the whole
+        run before anything is written.  ``True`` renders the frames that CAN be
+        converted and simply does not produce the others — no substituted number,
+        no placeholder raster.  The opt-out has to be written down at the call
+        site, exactly like ``require_ice_information`` and
+        ``require_spillway_highstand``: silence must not buy a weaker guarantee.
+    """
     pontic_df = pd.read_csv(PONTIC_CSV, comment="#")
     # Validate the curve ONCE, before any epoch lookup: sign flips are only
     # detectable on the curve as a whole, never on an individual scalar.
     for scenario in SCENARIOS:
         validate_basin_curve(pontic_df, "pontic", scenario)
+
+    # Same idea for the eustatic curve, and for the same reason: a truncated
+    # curve does not fail, it CLAMPS.  Stop before the first frame instead.
+    check_spratt_coverage(EPOCHS_KA)
+    datum = spratt_present_datum_m()
+    logger.info(
+        "eustatic curve: %s (%.0f-%.0f ka), published datum %+.2f m at 0 ka; every "
+        "frame thresholds on the 0-REFERENCED series (eustatic_level_m), so 0 ka "
+        "renders at 0.00 m and the 22 ka frame at %+.2f m.  See the SPRATT_CSV "
+        "comment for what that framing choice costs at the glacial end.",
+        SPRATT_CSV.name,
+        _spratt_ages_bp()[0] / 1000.0,
+        _spratt_ages_bp()[-1] / 1000.0,
+        datum,
+        eustatic_level_m(22),
+    )
+
+    # ── Threshold pre-flight ──────────────────────────────────────────────────
+    # T(t) = level(t) + Δz_solid(x_marker, t) for F2 rows, -offset(t) for F4 rows,
+    # and a refusal for a row with neither marker nor locus.  Resolve them ALL now.
+    thresholds, unconvertible = preflight_thresholds(pontic_df)
+    for _key, threshold in sorted(thresholds.items(), key=lambda kv: -kv[0][0]):
+        logger.info("threshold %s", threshold.provenance)
+    for (epoch, scenario), why in sorted(unconvertible.items(), key=lambda kv: -kv[0][0]):
+        logger.error("UNCONVERTIBLE %g ka / %s: %s", epoch, scenario, why)
+    if unconvertible and not skip_unconvertible:
+        raise UnconvertibleThresholdError(
+            f"{len(unconvertible)} of {len(EPOCHS_KA) * len(SCENARIOS)} frames "
+            "cannot be put into the paleo-DEM's vertical frame: "
+            + ", ".join(f"{e:g} ka/{s}" for (e, s) in sorted(unconvertible))
+            + ".  Nothing has been written.  Give those curve rows a marker, "
+            "register a locus for them, or call main(skip_unconvertible=True) to "
+            "render only the frames that ARE convertible — that option omits them "
+            "entirely and never substitutes a number for one."
+        )
 
     cfg = RenderConfig(max_px=2000, ice_model_label="ICE-6G_C")
 
@@ -928,19 +1726,34 @@ def main() -> None:
     coast_gdf = load_paleocostlines(PALEOCOASTLINES_SHP)
 
     print()
-    header = f"{'epoch':>6} | {'global_sl':>10} | {'grad':>7} | {'catas':>7}"
+    header = (
+        f"{'epoch':>6} | {'eustatic':>9} | {'grad_T':>8} {'rule':>13} | "
+        f"{'cat_T':>8} {'rule':>13}"
+    )
     print(header)
     print("-" * len(header))
 
     for epoch in EPOCHS_KA:
-        paleo_tif = build_paleo_dem(epoch)
-        global_sl = get_sea_level_for_epoch(epoch, SPRATT_CSV)
-
-        # CORRECT — one frame per scenario, DEM-driven at the basin level.
-        levels = {}
+        tags = {"eustatic_wrong_frame_m": f"{eustatic_level_m(epoch):.3f}"}
         for scenario in SCENARIOS:
-            bs_sl = pontic_level(pontic_df, epoch, scenario)
-            levels[scenario] = bs_sl
+            key = (epoch, scenario)
+            if key in thresholds:
+                tags[f"threshold_{scenario}"] = thresholds[key].provenance
+            else:
+                tags[f"threshold_{scenario}"] = (
+                    "UNCONVERTIBLE (no marker, no documented locus) — "
+                    "no frame was rendered for this scenario at this epoch"
+                )
+        paleo_tif = build_paleo_dem(epoch, provenance=tags)
+
+        # CORRECT — one frame per scenario, DEM-driven at the CONVERTED threshold.
+        cells = {}
+        for scenario in SCENARIOS:
+            threshold = thresholds.get((epoch, scenario))
+            if threshold is None:
+                cells[scenario] = f"{'--':>8} {'skipped':>13}"
+                continue
+            cells[scenario] = f"{threshold.threshold_m:>+8.2f} {threshold.rule:>13}"
             render_paleocostline_epoch(
                 epoch,
                 {"bs": str(paleo_tif)},
@@ -948,13 +1761,38 @@ def main() -> None:
                 paleocoastlines_shp=PALEOCOASTLINES_SHP,
                 output_dir=out_correct[scenario],
                 config=cfg,
-                data_source_label=f"Pontic-{scenario}",
-                sea_level_override_m=bs_sl,
+                data_source_label=f"Pontic-{scenario}-{threshold.rule}",
+                sea_level_override_m=threshold.threshold_m,
                 force_dem_mask=True,
                 preloaded_coast_gdf=coast_gdf,
             )
 
-        # WRONG — global eustatic, DEM-driven at the global level (comparison ref).
+        # WRONG — the deliberately-wrong comparison frame.
+        #
+        # THIS FRAME STAYS EUSTATIC ON PURPOSE.  Two documents disagree about it and
+        # the disagreement is resolved here so the next reader does not "fix" it:
+        #
+        #   * The re-bake verifier says these frames should switch to -offset(t),
+        #     because §5b of `2026-07-30-vertical-datum-contract.md` measures them as
+        #     10-37 m worse once the DEM is corrected.  That measurement is right.
+        #   * The contract audit says the opposite FOR THIS SCRIPT: these frames are
+        #     deliberately wrong.  They exist to show what a naive global-eustatic
+        #     treatment does inside a decoupled basin, which is the entire scientific
+        #     point of the render.  Switching them to -offset(t) would make them
+        #     CORRECT and delete the comparison.
+        #
+        # Ruling (owner, 2026-07-31): keep the eustatic curve here — being wrong is
+        # the job — but make it the GENUINE published Spratt & Lisiecki series
+        # rather than the hand-drawn sketch that used to ship, 0-referenced to
+        # present so that the 0/2 ka frames do not render sea level above the modern
+        # coast.  Being wrong about the PHYSICS is the demonstration; being wrong
+        # about the DATA was just a bug.
+        #
+        # The rule that decides this: a eustatic value survives only where a frame is
+        # MEANT to be wrong.  Anywhere a frame's threshold is an INTENDED ocean
+        # surface it must be -offset(t), which contract §2 proves exact — and that is
+        # what `pontic_threshold`'s "ocean_offset" rule now does for every
+        # post-reconnection (F4) row of the CORRECT frames.
         render_paleocostline_epoch(
             epoch,
             {"bs": str(paleo_tif)},
@@ -962,19 +1800,28 @@ def main() -> None:
             paleocoastlines_shp=PALEOCOASTLINES_SHP,
             output_dir=out_wrong,
             config=cfg,
-            data_source_label="global-eustatic",
-            sea_level_override_m=None,
+            data_source_label="global-eustatic (deliberately wrong)",
+            sea_level_override_m=eustatic_level_m(epoch),
             force_dem_mask=True,
             preloaded_coast_gdf=coast_gdf,
         )
 
-        print(f"{epoch:>6} | {global_sl:>+10.2f} | {levels['gradual']:>+7.1f} | "
-              f"{levels['catastrophic']:>+7.1f}")
+        print(
+            f"{epoch:>6} | {eustatic_level_m(epoch):>+9.2f} | "
+            f"{cells['gradual']} | {cells['catastrophic']}"
+        )
 
     print()
     print(f"Correct (gradual):      {out_correct['gradual']}")
     print(f"Correct (catastrophic): {out_correct['catastrophic']}")
     print(f"Wrong (global):         {out_wrong}")
+    if unconvertible:
+        print()
+        print(
+            f"OMITTED {len(unconvertible)} frame(s) with no convertible threshold "
+            "(no marker, no documented locus): "
+            + ", ".join(f"{e:g} ka/{s}" for (e, s) in sorted(unconvertible))
+        )
 
 
 if __name__ == "__main__":

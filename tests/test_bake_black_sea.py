@@ -1159,3 +1159,417 @@ def test_the_datum_call_still_uses_no_deep_threshold():
     src = inspect.getsource(b.gia_delta_subset)
     assert "deep_threshold" not in src
     assert "implied_sea_surface_offset" in src
+
+
+# ===========================================================================
+# TAIL 2 — the Spratt & Lisiecki curve: which file, and no silent clamping
+#
+# Two divergent "Spratt" CSVs shipped in this project and the bake read the
+# wrong one:
+#
+#   data/raw/sea_level_curves/spratt_lisiecki_2016_simplified.csv   0-20 ka, 1 ka
+#   data/sea_level_curves/spratt_lisiecki_2016_simplified.csv       0-26 ka, 0.5 ka
+#
+# NEITHER is Spratt & Lisiecki.  Both are hand-drawn round-number curves whose
+# values do not appear in the published stack at any age (16 ka: -105 m in the
+# file vs -98.06 m published; 10 ka: -50 m vs -24.59 m).  The published series
+# ships as ``spratt_lisiecki_2016_full.csv``, a bit-exact transcription of the
+# ``SeaLev_shortPC1`` column of the NOAA/WDS-Paleo distribution
+# ``spratt2016.txt`` (study 19982; Spratt & Lisiecki 2016, Clim. Past 12,
+# 1079-1092, doi:10.5194/cp-12-1079-2016).
+#
+# The 0-20 ka file also truncates below every requested epoch older than 20 ka,
+# and ``get_sea_level_for_epoch`` is nearest-neighbour: at 21 ka the nearest row
+# is exactly 1000 yr away, its warning tests ``> 1000``, and the clamp is
+# therefore SILENT.  That is the failure mode pinned here.
+# ===========================================================================
+
+_NOAA_SPRATT_TXT = (
+    b.PALEO_DATA_ROOT / "data" / "raw" / "sea_level_curves" / "spratt2016.txt"
+)
+_FABRICATED_SPRATT = (
+    b.PALEO_DATA_ROOT
+    / "data"
+    / "raw"
+    / "sea_level_curves"
+    / "spratt_lisiecki_2016_simplified.csv"
+)
+
+
+def _spratt_rows(path: Path):
+    return pd.read_csv(
+        path, comment="#", header=None,
+        names=["age_bp", "sea_level_m", "uncertainty_m"],
+    )
+
+
+def test_spratt_csv_points_at_the_published_series_not_a_simplified_sketch():
+    assert b.SPRATT_CSV.name == "spratt_lisiecki_2016_full.csv"
+    assert "simplified" not in b.SPRATT_CSV.name
+
+
+def test_spratt_csv_is_bit_exact_with_the_noaa_shortpc1_column():
+    """Provenance, not vibes: every row must equal the published column."""
+    if not (b.SPRATT_CSV.exists() and _NOAA_SPRATT_TXT.exists()):
+        pytest.skip("NOAA spratt2016.txt / curve CSV not present in this checkout")
+    published = {}
+    for line in _NOAA_SPRATT_TXT.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        parts = line.split("\t")
+        if parts[0] == "age_calkaBP":
+            assert parts[1] == "SeaLev_shortPC1"
+            assert parts[2] == "SeaLev_shortPC1_err_sig"
+            continue
+        published[float(parts[0]) * 1000.0] = (float(parts[1]), float(parts[2]))
+
+    df = _spratt_rows(b.SPRATT_CSV)
+    assert len(df) == 31, "0-30 ka at 1 ka steps"
+    for _, row in df.iterrows():
+        want_sl, want_err = published[float(row.age_bp)]
+        assert float(row.sea_level_m) == pytest.approx(want_sl, abs=1e-9), row.age_bp
+        assert float(row.uncertainty_m) == pytest.approx(want_err, abs=1e-9), row.age_bp
+
+
+def test_the_curve_the_bake_loads_matches_the_values_its_docstring_cites():
+    """The module docstring already quoted the PUBLISHED numbers.
+
+    "16 ka: global ~-98 m ... 10 ka: global ~-25 m" — the retired file returned
+    -105 and -50 there.  Docstring and data now agree.
+    """
+    if not b.SPRATT_CSV.exists():
+        pytest.skip("curve CSV not present in this checkout")
+    assert "-98 m" in b.__doc__ and "-25 m" in b.__doc__
+    assert get_sl(16.0) == pytest.approx(-98.06, abs=0.5)
+    assert get_sl(10.0) == pytest.approx(-24.59, abs=0.5)
+
+
+def get_sl(epoch_ka: float) -> float:
+    from paleoeurope.viz.paleocostline_render import get_sea_level_for_epoch
+    return get_sea_level_for_epoch(epoch_ka, b.SPRATT_CSV)
+
+
+def test_no_shipped_epoch_is_silently_clamped():
+    """Every epoch in EPOCHS_KA must be BRACKETED by the curve, not clamped."""
+    if not b.SPRATT_CSV.exists():
+        pytest.skip("curve CSV not present in this checkout")
+    b.check_spratt_coverage(b.EPOCHS_KA)  # must not raise
+    for epoch in b.EPOCHS_KA:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            get_sl(epoch)
+        assert not [w for w in caught if issubclass(w.category, UserWarning)], epoch
+
+
+def test_coverage_check_raises_on_the_truncated_curve_that_used_to_ship(tmp_path):
+    """The 0-20 ka file clamps 22 ka to the 20 ka row and must now be rejected."""
+    truncated = tmp_path / "truncated.csv"
+    truncated.write_text(
+        "# 0-20 ka only\n"
+        + "\n".join(f"{a},{-a / 160.0:.2f},1" for a in range(0, 20_001, 1000))
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(b.SprattCoverageError) as exc:
+        b.check_spratt_coverage([22.0, 18.0], truncated)
+    assert "22" in str(exc.value)
+    b.check_spratt_coverage([18.0, 0.0], truncated)  # inside the range: fine
+
+
+def test_coverage_check_rejects_a_gap_wider_than_half_a_step(tmp_path):
+    """A curve that BRACKETS an epoch but only every 5 ka is still not a lookup."""
+    coarse = tmp_path / "coarse.csv"
+    coarse.write_text("0,0,1\n5000,-10,1\n25000,-120,1\n", encoding="utf-8")
+    with pytest.raises(b.SprattCoverageError):
+        b.check_spratt_coverage([16.5], coarse)
+
+
+def test_spratt_present_datum_offset_is_pinned_and_declared():
+    """The published stack does NOT pass through 0 m at 0 ka: it reads +8.49 m.
+
+    1sigma there is +/-5.23 m, so 0 is well inside the published uncertainty.
+    Whether to subtract this offset (making the F4 column commensurate with
+    offset(t), which is 0 at 0 ka by construction) is a SCIENCE decision and is
+    deliberately NOT taken here — it is only made impossible to take silently.
+    """
+    if not b.SPRATT_CSV.exists():
+        pytest.skip("curve CSV not present in this checkout")
+    assert b.spratt_present_datum_m() == pytest.approx(8.49, abs=1e-9)
+
+
+def test_the_fabricated_simplified_curve_is_no_longer_reachable_from_the_bake():
+    """No CODE path may name it.  Comments about it are the point — keep those."""
+    code = "\n".join(
+        line
+        for line in Path(b.__file__).read_text(encoding="utf-8").splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    assert "spratt_lisiecki_2016_simplified.csv" not in code
+    assert not b.SPRATT_CSV.name.startswith("spratt_lisiecki_2016_simplified")
+
+
+def test_half_step_epochs_are_interpolated_not_snapped_to_the_younger_node():
+    """16.5 / 14.5 / 9.5 / 7.5 ka sit exactly between two 1-ka nodes.
+
+    This test used to pin the OPPOSITE: ``get_sea_level_for_epoch`` was
+    nearest-neighbour, ``idxmin`` broke the tie toward the YOUNGER (shallower)
+    node, and this docstring said "pinned so a future switch to interpolation is a
+    deliberate, visible change".  That switch was made deliberately on 2026-07-31
+    (``paleocostline_render.get_sea_level_for_epoch``: the tie was systematically
+    one-signed, +1.5 to +5.0 m too shallow at exactly these four epochs), so the
+    pin now records the new behaviour — visibly, in the same test.
+
+    Published nodes must still come back bit-exact.
+    """
+    if not b.SPRATT_CSV.exists():
+        pytest.skip("curve CSV not present in this checkout")
+    for half, young, old in ((16.5, 16.0, 17.0), (14.5, 14.0, 15.0), (9.5, 9.0, 10.0)):
+        mid = 0.5 * (get_sl(young) + get_sl(old))
+        assert get_sl(half) == pytest.approx(mid, abs=1e-9), half
+        assert get_sl(half) != pytest.approx(get_sl(young)), half
+    assert get_sl(16.0) == pytest.approx(-98.06, abs=1e-9)
+
+
+# ===========================================================================
+# TRACK A - the F2 -> F1 threshold conversion, and the comparison frames
+#
+# ``2026-07-30-vertical-datum-contract.md`` is a DOCUMENT; until now it was
+# implemented nowhere.  The bake passed the raw F2 CSV level straight through as
+# the closed-basin threshold, which is exactly the first row of the contract's
+# own "what breaks" table (section 8): the DEM was fixed, the threshold was not,
+# and the hero frames under-flood by ~12 m.
+#
+# The conversion is T(t) = level(t) + dz_solid(x_marker, t), applied at the
+# THRESHOLD and never in the curve (section 8 again: editing the level column
+# breaks ``validate_basin_curve``'s F2 semantics, and the level column is the
+# cited literature value).
+# ===========================================================================
+
+
+def _real_ice6g_epochs_or_skip():
+    for ep in b.EPOCHS_KA:
+        path = b.ICE6G_DIR / b._epoch_filename(ep)
+        if not path.exists():
+            pytest.skip(f"real ICE-6G file not available at {path}")
+
+
+# --- the three rules, and that a caller can see which one applied ------------
+
+
+def test_threshold_rules_are_exactly_three_and_named():
+    assert b.THRESHOLD_RULES == ("marker", "locus", "ocean_offset")
+
+
+def test_bosphorus_row_is_converted_with_its_own_marker():
+    """16.5 ka: the row's marker IS the Bosphorus sill, so the term is exact."""
+    _real_ice6g_epochs_or_skip()
+    t = b.pontic_threshold(_real_pontic_df(), 16.5, "gradual")
+    assert t.rule == "marker"
+    assert t.frame == "F2"
+    assert t.level_m == pytest.approx(-30.0)
+    assert t.conversion_m == pytest.approx(11.979, abs=5e-3)
+    assert t.threshold_m == pytest.approx(-18.02, abs=5e-3)
+    assert "29.1" in t.provenance and "41.2" in t.provenance
+
+
+def test_unknown_marker_row_falls_back_to_its_documented_locus_with_a_bracket():
+    """22 ka: no marker, but the seismic-wedge LOCUS is documented."""
+    _real_ice6g_epochs_or_skip()
+    t = b.pontic_threshold(_real_pontic_df(), 22, "gradual")
+    assert t.rule == "locus"
+    assert t.threshold_m == pytest.approx(-104.17, abs=0.05)
+    lo, hi = t.bracket_m
+    assert lo == pytest.approx(-108.90, abs=0.05)
+    assert hi == pytest.approx(-101.51, abs=0.05)
+    assert t.n_cells and t.n_cells > 10
+    assert "wedge" in t.provenance.lower()
+
+
+def test_every_locus_row_carries_its_own_p5_p95_bracket():
+    _real_ice6g_epochs_or_skip()
+    df = _real_pontic_df()
+    for epoch in (22, 18, 14.5, 12, 11):
+        t = b.pontic_threshold(df, epoch, "gradual")
+        assert t.rule == "locus", epoch
+        lo, hi = t.bracket_m
+        assert lo < t.threshold_m < hi, epoch
+
+
+# --- the rule that matters most: no marker, no locus -> RAISE ---------------
+
+
+def test_a_row_with_neither_marker_nor_locus_raises_rather_than_substituting():
+    """10 / 9.5 ka: the two columns diverge onto DIFFERENT unlocated markers."""
+    _real_ice6g_epochs_or_skip()
+    df = _real_pontic_df()
+    for epoch in (10, 9.5):
+        for scenario in b.SCENARIOS:
+            with pytest.raises(b.UnconvertibleThresholdError) as exc:
+                b.pontic_threshold(df, epoch, scenario)
+            assert "marker" in str(exc.value).lower(), (epoch, scenario)
+
+
+def test_the_bosphorus_cell_is_never_substituted_for_an_unlocated_row():
+    """The audited failure mode: that substitution is systematically one-signed."""
+    _real_ice6g_epochs_or_skip()
+    with pytest.raises(b.UnconvertibleThresholdError):
+        b.pontic_threshold(_real_pontic_df(), 10, "gradual")
+    src = inspect.getsource(b.pontic_threshold)
+    assert "over-flood" in src.lower() or "one-signed" in src.lower()
+
+
+def test_unconvertible_threshold_error_is_a_valueerror():
+    assert issubclass(b.UnconvertibleThresholdError, ValueError)
+
+
+# --- F4 rows: the reconnected basin IS the ocean, so -offset(t) is exact -----
+
+
+def test_f4_rows_threshold_on_minus_offset_not_on_the_curve_level():
+    """5 / 2 / 0 ka: an INTENDED-OCEAN threshold, switched to F3 per contract 2."""
+    _real_ice6g_epochs_or_skip()
+    df = _real_pontic_df()
+    for epoch in (5, 2, 0):
+        t = b.pontic_threshold(df, epoch, "gradual")
+        assert t.rule == "ocean_offset", epoch
+        assert t.frame == "F4"
+        assert t.threshold_m == pytest.approx(-b.sea_surface_offset(epoch), abs=1e-6)
+    assert b.pontic_threshold(df, 5, "gradual").threshold_m != pytest.approx(-10.0)
+
+
+def test_a_mixed_row_is_resolved_per_scenario_not_per_row():
+    """9 ka: gradual is already marine (F4); catastrophic is still a deep F2 lake."""
+    _real_ice6g_epochs_or_skip()
+    df = _real_pontic_df()
+    assert b.pontic_threshold(df, 9, "gradual").rule == "ocean_offset"
+    with pytest.raises(b.UnconvertibleThresholdError):
+        b.pontic_threshold(df, 9, "catastrophic")
+
+
+def test_offset_is_zero_at_present_by_construction():
+    _real_ice6g_epochs_or_skip()
+    assert b.sea_surface_offset(0) == pytest.approx(0.0, abs=1e-9)
+
+
+# --- the conversion is at the THRESHOLD, never in the curve -----------------
+
+
+def test_the_level_column_is_never_rewritten_by_the_conversion():
+    """Contract section 8: converting in the curve breaks validate_basin_curve."""
+    _real_ice6g_epochs_or_skip()
+    df = _real_pontic_df()
+    before = df.copy(deep=True)
+    for epoch, (grad, cat) in _HISTORICAL_PONTIC_LEVELS.items():
+        for scenario, want in (("gradual", grad), ("catastrophic", cat)):
+            try:
+                t = b.pontic_threshold(df, epoch, scenario)
+            except b.UnconvertibleThresholdError:
+                continue
+            assert t.level_m == pytest.approx(want), (epoch, scenario)
+    pd.testing.assert_frame_equal(df, before)
+
+
+def test_the_conversion_is_additive_for_every_f2_row():
+    _real_ice6g_epochs_or_skip()
+    df = _real_pontic_df()
+    for epoch in (22, 18, 16.5, 14.5, 12, 11):
+        t = b.pontic_threshold(df, epoch, "gradual")
+        assert t.frame == "F2"
+        assert t.threshold_m == pytest.approx(t.level_m + t.conversion_m, abs=1e-9)
+        assert t.conversion_m > 0.0, epoch
+
+
+def test_threshold_guard_is_not_an_assert_statement():
+    src = inspect.getsource(b.pontic_threshold) + inspect.getsource(
+        b.sea_surface_offset
+    )
+    assert "assert " not in src
+
+
+# --- the eustatic series is 0-referenced ------------------------------------
+
+
+def test_eustatic_series_is_zero_referenced_to_present():
+    if not b.SPRATT_CSV.exists():
+        pytest.skip("curve CSV not present in this checkout")
+    assert b.eustatic_level_m(0) == pytest.approx(0.0, abs=1e-9)
+    # ...and the published stack itself still reads +8.49 m there.
+    assert b.spratt_present_datum_m() == pytest.approx(8.49, abs=1e-9)
+
+
+def test_zero_referencing_moves_the_lgm_frame_to_the_documented_value():
+    if not b.SPRATT_CSV.exists():
+        pytest.skip("curve CSV not present in this checkout")
+    # 22 ka is a published node: -125.82 - 8.49.
+    assert b.eustatic_level_m(22) == pytest.approx(-134.31, abs=1e-2)
+    # 16.5 ka is a half-step, so it inherits the interpolation the render module
+    # switched to on 2026-07-31: mean(-98.06, -107.30) - 8.49.
+    assert b.eustatic_level_m(16.5) == pytest.approx(-111.17, abs=1e-2)
+
+
+# --- the deliberately-wrong frames stay eustatic ----------------------------
+
+
+def test_the_wrong_frames_still_threshold_on_the_eustatic_curve():
+    """They are the wrong-physics demonstration; making them right kills them."""
+    src = inspect.getsource(b.main)
+    wrong = src[src.index("WRONG"):]
+    assert "eustatic_level_m" in wrong
+    assert "sea_surface_offset" not in wrong
+
+
+def test_the_wrong_frames_call_site_names_both_documents():
+    src = inspect.getsource(b.main)
+    wrong = src[src.index("WRONG"):]
+    low = wrong.lower()
+    assert "2026-07-30-vertical-datum-contract" in low
+    assert "verifier" in low
+
+
+# --- provenance reaches the raster and the log ------------------------------
+
+
+def test_build_paleo_dem_writes_the_threshold_provenance_into_the_raster(
+    tmp_path, monkeypatch
+):
+    rasterio = pytest.importorskip("rasterio")
+    _fake_ice6g_dir(tmp_path, monkeypatch, epoch=16.5)
+    monkeypatch.setattr(b, "BS_DEM", _fake_dem(tmp_path))
+    monkeypatch.setattr(b, "PALEO_TIF_DIR", tmp_path / "out")
+    out = b.build_paleo_dem(
+        16.5, provenance={"threshold_gradual": "-18.02 m rule=marker"}
+    )
+    with rasterio.open(out) as ds:
+        tags = ds.tags()
+    assert tags["threshold_gradual"] == "-18.02 m rule=marker"
+
+
+def test_every_threshold_reports_its_rule_in_one_line():
+    _real_ice6g_epochs_or_skip()
+    t = b.pontic_threshold(_real_pontic_df(), 16.5, "gradual")
+    assert t.rule in b.THRESHOLD_RULES
+    assert t.rule in t.provenance
+
+
+# --- the ignored primary input: drift must be catchable ---------------------
+
+#: sha256 over the PARSED, canonicalised rows of ``spratt_lisiecki_2016_full.csv``
+#: (age,level,err at 6 dp, ascending, newline-joined).  ``spratt2016.txt`` lives
+#: under the same gitignored ``data/raw/`` tree, so the row-by-row provenance test
+#: above SKIPS in any checkout that does not happen to carry it - and skipping is
+#: not catching.  This pin needs only the one file the bake actually reads.
+_SPRATT_CANONICAL_SHA256 = (
+    "9ef3a77f96e5cce9e202ca50c483c14923d13b271fad5ca234627a722529b484"
+)
+
+
+def test_spratt_csv_content_is_pinned_without_needing_the_noaa_file():
+    if not b.SPRATT_CSV.exists():
+        pytest.skip("curve CSV not present in this checkout")
+    df = _spratt_rows(b.SPRATT_CSV).sort_values("age_bp")
+    canon = "\n".join(
+        f"{float(r.age_bp):.6f},{float(r.sea_level_m):.6f},{float(r.uncertainty_m):.6f}"
+        for r in df.itertuples()
+    )
+    got = hashlib.sha256(canon.encode("ascii")).hexdigest()
+    assert got == _SPRATT_CANONICAL_SHA256

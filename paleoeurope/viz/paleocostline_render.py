@@ -128,19 +128,89 @@ class RenderConfig:
 # ---------------------------------------------------------------------------
 
 
-def get_sea_level_for_epoch(epoch_ka: float, csv_path: Path) -> float:
+# Widest spacing (years) between the two published nodes bracketing a requested
+# epoch that still counts as READING the eustatic curve rather than inventing a
+# number across a hole in it.  The published Spratt & Lisiecki (2016) stack is on
+# a uniform 1 ka grid (NOAA/WDS-Paleo study 19982), so 1000 yr means "the two
+# adjacent published samples"; anything wider means the curve does not resolve
+# the epoch and :func:`get_sea_level_for_epoch` says so instead of answering.
+MAX_CURVE_NODE_GAP_YR = 1_000.0
+
+
+class SeaLevelCurveResolutionError(ValueError):
+    """The eustatic curve does not resolve the requested epoch.
+
+    Raised when the two curve rows bracketing the request are further apart than
+    ``max_node_gap_yr``, i.e. when producing a value would mean bridging a hole
+    in the curve rather than reading between two adjacent published samples.
+    """
+
+
+def get_sea_level_for_epoch(
+    epoch_ka: float,
+    csv_path: Path,
+    *,
+    max_node_gap_yr: float = MAX_CURVE_NODE_GAP_YR,
+) -> float:
     """Return the Spratt & Lisiecki (2016) sea-level value for *epoch_ka*.
 
     The CSV must contain three columns (no header, ``#``-prefixed comment lines
     allowed): **age_BP** (years), **sea_level_m** (m relative to present),
     **uncertainty_m** (m, not used here).
 
+    Interpolated, not snapped
+    -------------------------
+    Sea level is a continuous quantity sampled on a discrete age grid, so a
+    request between two nodes is answered by **linear interpolation in age**
+    between the bracketing rows.  On a node the published value is returned
+    bit-exact, so nothing that asks for a published age moves.
+
+    This replaces a nearest-neighbour lookup that was *systematically biased*.
+    The published stack is on a uniform 1 ka grid, ``pandas.Series.idxmin``
+    returns the FIRST row attaining the minimum, and the CSV is ascending in
+    age — so an epoch landing exactly halfway between two nodes always resolved
+    to the YOUNGER, i.e. SHALLOWER, node.  Four of the thirteen epochs the
+    Black-Sea bake ships do exactly that, two of them the hero frames::
+
+          ka    nearest-neighbour      interpolated      error
+        16.5      -98.06  (16 ka)         -102.680     +4.620 m
+        14.5      -76.64  (14 ka)          -81.605     +4.965 m
+         9.5      -15.83  ( 9 ka)          -20.210     +4.380 m
+         7.5       -6.11  ( 7 ka)           -7.600     +1.490 m
+
+    and it did so *silently*: the miss is exactly 500 yr — exactly half a step —
+    which every guard in the project tests with a strict ``>`` inequality.
+    Interpolation removes the tie rather than arbitrating it, so there is no
+    half-step boundary condition left to fall through.
+
+    What it refuses to do
+    ---------------------
+    * **Bridge a hole.**  If the bracketing rows are more than *max_node_gap_yr*
+      apart the request is not a lookup, and :class:`SeaLevelCurveResolutionError`
+      is raised rather than a plausible-looking number returned.
+    * **Clamp in silence.**  Off either end of the curve the endpoint value is
+      still returned (callers such as the bake's coverage check turn this into a
+      hard stop of their own), but *any* such extrapolation now warns.  The old
+      warning fired only above a 1000 yr miss, so a 0-20 ka curve asked for
+      21 ka — missing by exactly 1000 yr — clamped without a word.
+
+    This function is for the CONTINUOUS eustatic curve only.  Do not reuse it for
+    a step-keyed or stage-keyed series: the discrete coastline layers of
+    :func:`filter_paleocostlines_for_epoch` and a closed-basin curve carrying a
+    genuine reconnection discontinuity must both stay nearest-neighbour, because
+    the value halfway between two of their rows does not exist.
+
     Parameters
     ----------
     epoch_ka : float
         Target epoch in ka BP (e.g. ``21.0``).
     csv_path : Path
-        Path to ``spratt_lisiecki_2016_simplified.csv``.
+        Path to the eustatic curve CSV (``spratt_lisiecki_2016_full.csv``).
+    max_node_gap_yr : float, keyword-only
+        Widest bracketing-node spacing (years) still considered a lookup.
+        Defaults to :data:`MAX_CURVE_NODE_GAP_YR` (one step of the published
+        1 ka grid).  Raise it only if you own a coarser curve and are prepared
+        to say so in writing.
 
     Returns
     -------
@@ -151,6 +221,9 @@ def get_sea_level_for_epoch(epoch_ka: float, csv_path: Path) -> float:
     ------
     FileNotFoundError
         If *csv_path* does not exist.
+    SeaLevelCurveResolutionError
+        If the curve is empty, or if the bracketing rows are further apart than
+        *max_node_gap_yr*.
     """
     csv_path = Path(csv_path)
     if not csv_path.exists():
@@ -162,22 +235,54 @@ def get_sea_level_for_epoch(epoch_ka: float, csv_path: Path) -> float:
         header=None,
         names=["age_bp", "sea_level_m", "uncertainty_m"],
     )
-    idx = (df["age_bp"] - epoch_ka * 1_000.0).abs().idxmin()
-    matched_age = int(df.loc[idx, "age_bp"])
-    sl = float(df.loc[idx, "sea_level_m"])
+    df = df[["age_bp", "sea_level_m"]].apply(pd.to_numeric, errors="coerce").dropna()
+    # np.interp / np.searchsorted are undefined on unsorted x, and a curve file
+    # is not required to be sorted.  Sort explicitly; drop duplicate ages so a
+    # repeated row cannot produce a zero-width bracket.
+    df = df.drop_duplicates(subset="age_bp").sort_values("age_bp")
+    ages = df["age_bp"].to_numpy(dtype=float)
+    levels = df["sea_level_m"].to_numpy(dtype=float)
+    if ages.size == 0:
+        raise SeaLevelCurveResolutionError(
+            f"Sea-level CSV has no usable (age_bp, sea_level_m) rows: {csv_path}"
+        )
 
-    age_diff = abs(matched_age - epoch_ka * 1_000)
-    if age_diff > 1_000:
-        import warnings
+    want = float(epoch_ka) * 1_000.0
 
+    # ── Off the end: clamp, but never in silence ────────────────────────────
+    if want < ages[0] or want > ages[-1]:
+        endpoint_age = ages[0] if want < ages[0] else ages[-1]
+        age_diff = abs(endpoint_age - want)
         warnings.warn(
-            f"Spratt CSV: closest row is {matched_age} BP "
-            f"(requested {int(epoch_ka * 1000)} BP, Δ = {age_diff:.0f} yr). "
-            "The CSV may be truncated — using clamped value.",
+            f"Spratt CSV: closest row is {int(endpoint_age)} BP "
+            f"(requested {int(want)} BP, Δ = {age_diff:.0f} yr). "
+            f"The curve covers {int(ages[0])}–{int(ages[-1])} BP and does not "
+            "reach this epoch — using clamped endpoint value.",
             UserWarning,
             stacklevel=2,
         )
-    return sl
+        return float(levels[0] if want < ages[0] else levels[-1])
+
+    # ── On a node: the published value, untouched ───────────────────────────
+    hit = np.flatnonzero(ages == want)
+    if hit.size:
+        return float(levels[hit[0]])
+
+    # ── Between nodes: interpolate, unless that would bridge a hole ─────────
+    hi = int(np.searchsorted(ages, want))
+    lo = hi - 1
+    gap = ages[hi] - ages[lo]
+    if gap > max_node_gap_yr:
+        raise SeaLevelCurveResolutionError(
+            f"eustatic curve {csv_path} does not resolve {epoch_ka} ka "
+            f"({int(want)} BP): the bracketing rows are {int(ages[lo])} BP and "
+            f"{int(ages[hi])} BP, {gap:.0f} yr apart — wider than the "
+            f"{max_node_gap_yr:.0f} yr budget. Interpolating across that hole "
+            "would invent a number the curve does not contain. Supply a curve "
+            "that samples this epoch, or pass an explicit max_node_gap_yr."
+        )
+    frac = (want - ages[lo]) / gap
+    return float(levels[lo] + frac * (levels[hi] - levels[lo]))
 
 
 def load_paleocostlines(shp_path: Path) -> Optional[gpd.GeoDataFrame]:

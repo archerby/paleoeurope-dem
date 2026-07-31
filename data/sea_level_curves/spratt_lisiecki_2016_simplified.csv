@@ -1,3 +1,27 @@
+# !! NOT THE PUBLISHED SPRATT & LISIECKI SERIES.  DO NOT USE FOR SCIENCE. !!
+#
+# Reconciled 2026-07-30.  The header below claims the values were "extracted and
+# interpolated from published Table S1 (0-26 ka at 0.5 ka steps)".  That claim
+# does not hold up: the Spratt & Lisiecki (2016) data are distributed at 1 ka
+# steps (NOAA/WDS-Paleo study 19982, PANGAEA 856145), and these values do not
+# match the published SeaLev_shortPC1 column at any age -
+#     16.5 ka: -107 here vs  -98.06 / -107.30 published at 16 / 17 ka
+#     10   ka:  -50 here vs  -24.59 published
+#      7.5 ka:  -22 here vs   -6.11 /  -9.09 published at 7 / 8 ka
+#      0   ka:    0 here vs   +8.49 published
+# On the 0-20 ka overlap it is bit-for-bit the sibling sketch
+# Paleo-Europe_3D/data/raw/sea_level_curves/spratt_lisiecki_2016_simplified.csv
+# plus half-step interpolation and a fabricated 20-26 ka extension.
+#
+# Use  Paleo-Europe_3D/data/raw/sea_level_curves/spratt_lisiecki_2016_full.csv
+# - a bit-exact transcription of NOAA spratt2016.txt, SeaLev_shortPC1 +
+# SeaLev_shortPC1_err_sig, 0-30 ka at 1 ka.
+#
+# Kept, unmodified, only so that frames already baked against it stay
+# reproducible.  scripts/bake_black_sea.py no longer reads it; the two legacy
+# render_black_sea_*.py scripts still do.
+#
+# --- original header, as written --------------------------------------------
 # Spratt & Lisiecki (2016) Sea Level Curve — simplified extract for paleoeurope pipeline
 #
 # Reference:
