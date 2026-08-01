@@ -43,10 +43,14 @@ Examples
 from __future__ import annotations
 
 import gc
+import heapq
+import json
 import warnings
+from collections import deque
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 import geopandas as gpd
 import matplotlib.colors as mcolors
@@ -65,6 +69,9 @@ from scipy.ndimage import (
     binary_opening,
     gaussian_filter,
     gaussian_filter1d,
+)
+from scipy.ndimage import (
+    label as ndi_label,
 )
 from shapely.geometry import box as shp_box
 from shapely.validation import make_valid
@@ -440,7 +447,7 @@ def rasterize_land_mask(
 def ocean_depth_from_surface(
     dem: np.ndarray,
     ocean_mask: np.ndarray,
-    water_level: float,
+    water_level: float | np.ndarray,
 ) -> np.ndarray:
     """Water-column depth below the epoch water surface (m, ``>= 0``) on ocean pixels.
 
@@ -450,6 +457,13 @@ def ocean_depth_from_surface(
     (present global SL = 0).  Using the epoch surface — not the present 0 m datum —
     is what makes a lowered decoupled basin read as a *shallower* body, so a
     ~100 m drawdown is visible in the shading instead of looking as deep as today.
+
+    It may be a **scalar** (one basin, one surface — the original behaviour, and
+    the arithmetic below is unchanged for it) or an **array broadcastable to
+    ``dem``** (several basins standing at different levels in one frame, plus the
+    ramped spill corridor between them — see :func:`assign_basins`).  Cells whose
+    surface is NaN (no basin owns them) are never in ``ocean_mask``, so they
+    contribute 0.
     """
     return np.where(ocean_mask, np.clip(water_level - dem, 0.0, None), 0.0)
 
@@ -457,7 +471,7 @@ def ocean_depth_from_surface(
 def dem_threshold_ocean(
     dem_sm: np.ndarray,
     nodata: np.ndarray,
-    water_level: float,
+    water_level: float | np.ndarray,
 ) -> np.ndarray:
     """Boolean ocean mask from the DEM: submerged where ``dem_sm < water_level``.
 
@@ -465,11 +479,613 @@ def dem_threshold_ocean(
     closing then opening (2 iterations each) removes single-pixel speckle.  This
     is the basin-correct replacement for the old hard ``dem_sm < 0.0`` fallback,
     which silently ignored the override.
+
+    ``water_level`` may be a **scalar** (one basin at one level — unchanged) or an
+    **array broadcastable to ``dem_sm``** (the per-cell water surface produced by
+    :func:`assign_basins` when two basins stand at different levels in the same
+    frame).  A NaN entry means "no basin owns this cell": ``dem_sm < NaN`` is
+    False, so such a cell is land, which is the honest reading — the frame carries
+    no level for it.
     """
     ocean_raw = (~nodata) & (dem_sm < water_level)
     ocean = binary_closing(ocean_raw, iterations=2) & (~nodata)
     ocean = binary_opening(ocean, iterations=2).astype(bool)
     return ocean
+
+
+# ---------------------------------------------------------------------------
+# Two basins, two levels, one frame
+# ---------------------------------------------------------------------------
+
+
+class SillResolutionError(ValueError):
+    """This frame's DEM disagrees with an independently measured sill elevation.
+
+    ``spilling`` is only as honest as the grid it is observed on, and a spillway
+    narrower than the working pixel is filled in by resampling.  Measured on the
+    real Caspian↔Pontic raster (2026-08-01), the Manych saddle reads
+
+    ==========================================================  =========
+    native GEBCO 15 arcsec, untouched                            +25.00 m
+    bilinear-downsampled to a 2000 px render mosaic              +30.00 m
+    ... plus the renderer's ``dem_sm`` gaussian σ = 1.5 px       +33.35 m
+    ... plus ``build_epoch_mosaic``'s tile-seam blend at 44 E    +38.52 m
+    ==========================================================  =========
+
+    — 13.5 m of purely numerical rise, which at a +35 m Khvalynian highstand
+    turns a SPILLING frame into an endorheic one without a word.  A caller who
+    has measured the sill at native resolution passes it as
+    ``sill_expectations`` and gets this exception instead of a quietly wrong
+    animation.
+    """
+
+
+class CorridorNotRampableError(NotImplementedError):
+    """More than one pair of basins is spilling into another at this epoch.
+
+    The linear water-surface ramp implemented by :func:`assign_basins` is defined
+    for exactly **one** donor→receiver corridor.  With several simultaneous
+    corridors the surface in each depends on how the discharges divide, which is a
+    hydraulic question this module does not answer and will not guess at.  Pass
+    ``corridor="step"`` to get every basin at its own flat level with the
+    corridors *marked* instead.
+    """
+
+
+@dataclass(frozen=True)
+class BasinSeed:
+    """One named basin, located by a point that is under its own water.
+
+    Parameters
+    ----------
+    name : str
+        Basin name, e.g. ``"caspian"``.  Must be unique within one call and is
+        what appears in the figure, the sidecar JSON and the sill keys.
+    lon, lat : float
+        Seed coordinates **in the CRS of the DEM being assigned** (EPSG:4326 for
+        every raster in this project).  The cell containing this point is the
+        growth origin of the basin.
+    level_m : float
+        This basin's water surface for the epoch, in the SAME vertical frame as
+        the DEM — i.e. F1 for the paleo-DEM, which for an F2 literature level
+        means ``level + Δz_solid(x_marker, t)`` has ALREADY been applied by the
+        caller.  See ``2026-07-30-vertical-datum-contract.md`` §1 and §5a-bis;
+        this function does no frame conversion and cannot detect a wrong one.
+    """
+
+    name: str
+    lon: float
+    lat: float
+    level_m: float
+
+
+@dataclass(frozen=True)
+class BasinField:
+    """The per-cell result of :func:`assign_basins`.
+
+    Attributes
+    ----------
+    basin_id : np.ndarray[int32]
+        ``0`` = no basin owns this cell (nodata, above the flood ceiling, or in a
+        depression that reaches neither seed).  ``i+1`` = owned by ``names[i]``.
+    names, levels_m : tuple
+        The seeds, in input order.
+    bottleneck_m : np.ndarray[float64]
+        For each owned cell, the lowest elevation a path from its seed can be held
+        under — the minimax ("bottleneck") elevation.  ``inf`` where unowned.
+        This is what makes the sill measurable: the saddle between two basins is
+        the lowest ``max(bottleneck_a, bottleneck_b)`` over the cells where their
+        territories touch.
+    water_level_m : np.ndarray[float64]
+        The water SURFACE at each cell: the owning basin's level, except inside a
+        ramped spill corridor where it is interpolated between donor and receiver.
+        NaN where no basin owns the cell.
+    water_mask : np.ndarray[bool]
+        ``dem < water_level_m``.  This is the two-basin generalisation of the
+        single scalar threshold.
+    corridor_mask : np.ndarray[bool]
+        Cells of the spill corridor.  In ``"ramp"`` mode these are the corridor
+        cells that are actually wet; in ``"step"`` mode they are the cells the
+        spill would flow through, marked but NOT given a made-up surface.
+    spilling : bool
+        **Observed from the terrain**, not read off a curve: True iff at least one
+        pair of seeded fills merges at the epoch's own levels.
+    connected_groups : tuple[tuple[str, ...], ...]
+        Basins grouped by hydrological connection at this epoch.  Two separate
+        basins give ``(("caspian",), ("pontic",))``; once they spill,
+        ``(("caspian", "pontic"),)``.
+    sill_m, sill_lonlat : dict
+        Per unordered basin pair (key = the two names, sorted): the measured
+        saddle elevation and where it is.  **NaN / None when the saddle lies above
+        the flood ceiling** — the algorithm never invents one it did not reach.
+    corridor_mode : {"none", "ramp", "step"}
+    ceiling_m : float
+        The elevation the ownership flood was capped at.
+    """
+
+    basin_id: np.ndarray
+    names: tuple[str, ...]
+    levels_m: tuple[float, ...]
+    bottleneck_m: np.ndarray
+    water_level_m: np.ndarray
+    water_mask: np.ndarray
+    corridor_mask: np.ndarray
+    spilling: bool
+    connected_groups: tuple[tuple[str, ...], ...]
+    sill_m: dict = dataclass_field(default_factory=dict)
+    sill_lonlat: dict = dataclass_field(default_factory=dict)
+    corridor_mode: str = "none"
+    ceiling_m: float = float("nan")
+
+
+def _seed_rowcol(
+    transform: rasterio.transform.Affine,
+    lon: float,
+    lat: float,
+    shape: tuple[int, int],
+    name: str,
+) -> tuple[int, int]:
+    """Cell containing (*lon*, *lat*); raises if that is off the raster."""
+    height, width = shape
+    col_f, row_f = ~transform * (float(lon), float(lat))
+    row, col = int(np.floor(row_f)), int(np.floor(col_f))
+    if not (0 <= row < height and 0 <= col < width):
+        raise ValueError(
+            f"basin seed {name!r} at {lon:.4f} E / {lat:.4f} N falls outside the "
+            f"raster (it maps to row {row}, col {col} of a {height}x{width} grid). "
+            "A seed off the frame would silently produce an empty basin."
+        )
+    return row, col
+
+
+def _priority_flood_ownership(
+    dem: np.ndarray,
+    seed_rc: Sequence[tuple[int, int]],
+    ceiling: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Grow every seed by ascending bottleneck elevation; return (owner, bottleneck).
+
+    This is the classic priority-flood / flooding-watershed: the frontier cell that
+    can be reached while staying LOWEST is always claimed next, so a cell ends up
+    owned by the basin it drains to — the water divide, not a bounding box.  The
+    value recorded per cell is the minimax elevation along the path that claimed
+    it, which is exactly what a saddle measurement needs.
+
+    Deterministic: heap entries are ``(bottleneck, flat_index, label)`` and a cell
+    is pushed at most once, so ``flat_index`` breaks every tie the same way on
+    every run and on every machine.  4-connectivity, matching
+    :func:`scipy.ndimage.label`'s default structure so the ownership flood and the
+    spill-connectivity test agree about what "connected" means.
+
+    Cells above *ceiling*, and NaN cells, are never claimed.
+    """
+    height, width = dem.shape
+    flat = np.ascontiguousarray(dem, dtype=np.float64).ravel()
+    # Python lists are ~4x faster than numpy scalar indexing in this inner loop,
+    # which runs once per cell of a 2000-px mosaic.
+    elevations = flat.tolist()
+    passable = (np.isfinite(flat) & (flat <= ceiling)).tolist()
+    owner = [0] * flat.size
+    bottleneck = [float("inf")] * flat.size
+
+    heap: list[tuple[float, int, int]] = []
+    for label, (row, col) in enumerate(seed_rc, start=1):
+        idx = row * width + col
+        owner[idx] = label
+        bottleneck[idx] = elevations[idx]
+        heapq.heappush(heap, (elevations[idx], idx, label))
+
+    push, pop = heapq.heappush, heapq.heappop
+    last_col = width - 1
+    last_row = height - 1
+    while heap:
+        here, idx, label = pop(heap)
+        row = idx // width
+        col = idx - row * width
+        for nbr in (
+            idx - width if row else -1,
+            idx + width if row < last_row else -1,
+            idx - 1 if col else -1,
+            idx + 1 if col < last_col else -1,
+        ):
+            if nbr < 0 or owner[nbr] or not passable[nbr]:
+                continue
+            owner[nbr] = label
+            deeper = elevations[nbr]
+            reach = here if here > deeper else deeper
+            bottleneck[nbr] = reach
+            push(heap, (reach, nbr, label))
+
+    return (
+        np.asarray(owner, dtype=np.int32).reshape(height, width),
+        np.asarray(bottleneck, dtype=np.float64).reshape(height, width),
+    )
+
+
+def _measure_sills(
+    basin_id: np.ndarray,
+    bottleneck: np.ndarray,
+    n_basins: int,
+) -> dict[tuple[int, int], tuple[float, tuple[int, int]]]:
+    """Saddle elevation + location for every pair of basin territories that touch.
+
+    The saddle between two basins is ``min`` over all 4-adjacent cell pairs
+    straddling their common border of ``max(bottleneck_a, bottleneck_b)``, and its
+    location is the higher of that winning pair — i.e. the actual crest cell.
+    Pairs whose territories never touch (because the flood ceiling cut the ridge
+    off) are simply absent, and the caller reports them as unknown.
+    """
+    best: dict[tuple[int, int], tuple[float, tuple[int, int]]] = {}
+    height, width = basin_id.shape
+    rows, cols = np.indices((height, width))
+
+    for axis in (0, 1):
+        if axis == 0:
+            lab_a, lab_b = basin_id[:-1, :], basin_id[1:, :]
+            bot_a, bot_b = bottleneck[:-1, :], bottleneck[1:, :]
+            row_a, row_b = rows[:-1, :], rows[1:, :]
+            col_a, col_b = cols[:-1, :], cols[1:, :]
+        else:
+            lab_a, lab_b = basin_id[:, :-1], basin_id[:, 1:]
+            bot_a, bot_b = bottleneck[:, :-1], bottleneck[:, 1:]
+            row_a, row_b = rows[:, :-1], rows[:, 1:]
+            col_a, col_b = cols[:, :-1], cols[:, 1:]
+
+        touching = (lab_a > 0) & (lab_b > 0) & (lab_a != lab_b)
+        if not touching.any():
+            continue
+        crest = np.maximum(bot_a, bot_b)[touching]
+        take_b = (bot_b >= bot_a)[touching]
+        crest_row = np.where(take_b, row_b[touching], row_a[touching])
+        crest_col = np.where(take_b, col_b[touching], col_a[touching])
+        pair_lo = np.minimum(lab_a, lab_b)[touching]
+        pair_hi = np.maximum(lab_a, lab_b)[touching]
+        key = pair_lo.astype(np.int64) * (n_basins + 1) + pair_hi
+
+        for encoded in np.unique(key):
+            sel = key == encoded
+            winner = int(np.argmin(crest[sel]))
+            value = float(crest[sel][winner])
+            where = (int(crest_row[sel][winner]), int(crest_col[sel][winner]))
+            pair = (int(encoded // (n_basins + 1)), int(encoded % (n_basins + 1)))
+            if pair not in best or value < best[pair][0]:
+                best[pair] = (value, where)
+
+    return best
+
+
+def _geodesic_hops(region: np.ndarray, source: np.ndarray) -> np.ndarray:
+    """4-connected hop count from *source* to every cell of *region*, staying inside it.
+
+    Cells of *region* adjacent to *source* are at distance 1.  Unreachable cells
+    are ``inf``.  This is a graph distance in PIXELS, not a metric length and not a
+    hydraulic path — it exists only to parameterise the corridor ramp from one end
+    to the other, and inside a channel it is monotone along the channel, which is
+    all the ramp needs.
+    """
+    height, width = region.shape
+    dist = np.full(region.size, np.inf)
+    inside = region.ravel()
+
+    adjacent = np.zeros_like(region)
+    adjacent[:-1, :] |= source[1:, :]
+    adjacent[1:, :] |= source[:-1, :]
+    adjacent[:, :-1] |= source[:, 1:]
+    adjacent[:, 1:] |= source[:, :-1]
+    start = np.flatnonzero((region & adjacent).ravel())
+    dist[start] = 1.0
+
+    queue = deque(int(i) for i in start)
+    last_row, last_col = height - 1, width - 1
+    while queue:
+        idx = queue.popleft()
+        here = dist[idx]
+        row = idx // width
+        col = idx - row * width
+        for nbr in (
+            idx - width if row else -1,
+            idx + width if row < last_row else -1,
+            idx - 1 if col else -1,
+            idx + 1 if col < last_col else -1,
+        ):
+            if nbr < 0 or not inside[nbr] or dist[nbr] <= here + 1.0:
+                continue
+            dist[nbr] = here + 1.0
+            queue.append(nbr)
+
+    return dist.reshape(height, width)
+
+
+def assign_basins(
+    dem: np.ndarray,
+    transform: rasterio.transform.Affine,
+    seeds: Sequence[BasinSeed],
+    *,
+    ceiling_margin_m: float = 100.0,
+    corridor: str = "ramp",
+    sill_expectations: Optional[dict] = None,
+    sill_tolerance_m: float = 2.0,
+) -> BasinField:
+    """Assign every cell to the basin it drains to, and threshold each at its own level.
+
+    This is the multi-basin generalisation of a single scalar sea level.  The hero
+    frame of the Khvalynian reconstruction — the Caspian near +35 m and the Pontic
+    near −30 m **in one image**, with water crossing the Manych — is inexpressible
+    with one number, and this is the object that expresses it.
+
+    How membership is decided
+    -------------------------
+    By a seeded priority flood over the DEM (:func:`_priority_flood_ownership`),
+    not by a bounding box: the frontier cell reachable at the LOWEST elevation is
+    always claimed next, so a cell ends up in the basin whose seed it can reach
+    without crossing a higher barrier — the drainage divide.  A consequence worth
+    having is that the **saddle between two basins falls out of the same flood**,
+    so the sill elevation reported here is *measured off the terrain* rather than
+    quoted from a document.
+
+    How the spill is decided
+    ------------------------
+    Also from the terrain: two basins are connected iff the fill of the higher one
+    **at its own level** reaches the other one's seed (``scipy.ndimage.label`` on
+    ``dem < max(level_i, level_j)``).  That is the "the two fills merged" test, and
+    it is the animation's whole subject, so it is a first-class output
+    (:attr:`BasinField.spilling`, :attr:`BasinField.connected_groups`) rather than
+    an assertion carried in from a level curve.
+
+    The corridor between two levels
+    -------------------------------
+    Between a donor basin at +35 m and a receiver at −30 m the water surface is a
+    **gradient, not a step, and not a 60 m wall of blue**.  With ``corridor="ramp"``
+    (default) each corridor cell gets
+
+    ``L = level_donor + (level_receiver − level_donor) · d_donor / (d_donor + d_receiver)``
+
+    where the two ``d`` are 4-connected hop distances measured *inside the corridor*
+    from the donor's water and from the receiver's water.  The profile is linear in
+    along-channel graph distance, monotone, and exact at both ends.  It also fixes
+    the failure mode a naive "flood everything below the donor level" produces —
+    filling the whole receiving basin to the donor's surface — because far from the
+    channel ``d_donor ≫ d_receiver``, so ``L`` collapses onto the receiver's level
+    and those cells stay dry.
+
+    **What this ramp is not.**  It is not hydraulics.  There is no discharge, no
+    channel roughness, no backwater: the lateral extent of the flow is set here by
+    where the terrain lies below a linearly-interpolated surface, and a real
+    spillway's width is set by how much water is moving.  A linear water-surface
+    profile is the standard first-order assumption for a uniform channel and it is
+    defensible for a figure; it is not a flood model.  If several corridors are
+    open at once the interpolation is undefined and this function
+    :class:`raises <CorridorNotRampableError>` — pass ``corridor="step"`` to get
+    every basin flat at its own level with the corridor cells MARKED in
+    :attr:`BasinField.corridor_mask` instead of drawn as an invented surface.
+
+    Parameters
+    ----------
+    dem : np.ndarray
+        Elevation grid, metres, present-day datum; NaN = nodata.  Pass the SAME
+        array the land/sea threshold will run on (the renderer passes its smoothed
+        ``dem_sm``), so ownership, sill and mask cannot disagree.
+    transform : rasterio.transform.Affine
+        Affine transform of *dem*, used only to locate the seeds and to report the
+        sill positions.
+    seeds : sequence of BasinSeed
+        One per basin.  Levels must already be in the DEM's vertical frame.
+    ceiling_margin_m : float
+        The ownership flood stops at ``max(level) + ceiling_margin_m``.  Cells above
+        it are unowned (and land at every basin's level, so nothing is lost) — the
+        cap is what keeps the flood proportional to the interesting part of the
+        scene.  Raise it if you need a saddle that stands far above every level;
+        a saddle above the ceiling is reported as NaN, never guessed.
+    corridor : {"ramp", "step"}
+    sill_expectations : mapping {(name, name): metres} | None
+        Independently measured saddle elevations, e.g. the Manych sill read
+        straight off native-resolution GEBCO.  Each is compared against what THIS
+        grid resolves and :class:`SillResolutionError` is raised on a
+        disagreement wider than *sill_tolerance_m* — see that exception for the
+        13.5 m of resampling-induced sill rise that motivates it.  Key order does
+        not matter.  A saddle the flood never reached also raises: "I could not
+        see it" must not read as "it agrees".
+    sill_tolerance_m : float
+        Default 2.0 m.
+
+    Raises
+    ------
+    ValueError
+        No seeds; duplicate basin names; a seed off the raster; a seed on nodata;
+        an expectation naming a basin that is not in *seeds*; or a seed standing
+        ABOVE its own level — that last one would quietly produce an empty basin,
+        which is precisely the class of silent wrongness this project refuses.
+    SillResolutionError
+        A sill this grid resolves disagrees with a supplied measurement.
+    CorridorNotRampableError
+        ``corridor="ramp"`` with more than one spilling pair.
+    """
+    if corridor not in ("ramp", "step"):
+        raise ValueError(f"corridor={corridor!r} is not one of 'ramp', 'step'")
+    seeds = list(seeds)
+    if not seeds:
+        raise ValueError("assign_basins needs at least one BasinSeed")
+    names = [s.name for s in seeds]
+    if len(set(names)) != len(names):
+        raise ValueError(f"basin names must be unique, got {names!r}")
+
+    dem = np.asarray(dem, dtype=np.float64)
+    height, width = dem.shape
+    seed_rc: list[tuple[int, int]] = []
+    for seed in seeds:
+        row, col = _seed_rowcol(transform, seed.lon, seed.lat, (height, width), seed.name)
+        value = dem[row, col]
+        if not np.isfinite(value):
+            raise ValueError(
+                f"basin seed {seed.name!r} at {seed.lon:.4f} E / {seed.lat:.4f} N "
+                "lands on a nodata cell of the DEM."
+            )
+        if value >= seed.level_m:
+            raise ValueError(
+                f"basin seed {seed.name!r} sits at {value:+.2f} m, which is above "
+                f"its own level {seed.level_m:+.2f} m. A seed must be under its "
+                "basin's water; on dry land it grows an empty basin and the frame "
+                "silently loses a sea."
+            )
+        seed_rc.append((row, col))
+    if len(set(seed_rc)) != len(seed_rc):
+        raise ValueError(
+            "two basin seeds fall in the same DEM cell; they cannot be told apart"
+        )
+
+    levels = [float(s.level_m) for s in seeds]
+    ceiling = float(max(levels) + ceiling_margin_m)
+    basin_id, bottleneck = _priority_flood_ownership(dem, seed_rc, ceiling)
+
+    # ── Sills, measured ──────────────────────────────────────────────────────
+    touching = _measure_sills(basin_id, bottleneck, len(seeds))
+    sill_m: dict[tuple[str, str], float] = {}
+    sill_lonlat: dict[tuple[str, str], tuple[float, float] | None] = {}
+    for i in range(len(seeds)):
+        for j in range(i + 1, len(seeds)):
+            key = tuple(sorted((names[i], names[j])))
+            found = touching.get((i + 1, j + 1))
+            if found is None:
+                sill_m[key] = float("nan")
+                sill_lonlat[key] = None
+            else:
+                value, (row, col) = found
+                sill_m[key] = value
+                lon, lat = transform * (col + 0.5, row + 0.5)
+                sill_lonlat[key] = (float(lon), float(lat))
+
+    for raw_pair, expected in (sill_expectations or {}).items():
+        key = tuple(sorted(raw_pair))
+        if key not in sill_m:
+            raise ValueError(
+                f"sill_expectations key {tuple(raw_pair)!r} is not a basin pair of "
+                f"this call; the basins are {tuple(names)!r}."
+            )
+        measured = sill_m[key]
+        if not np.isfinite(measured):
+            raise SillResolutionError(
+                f"a sill of {float(expected):+.2f} m was supplied for "
+                f"{key[0]}<->{key[1]}, but their territories never met: the "
+                f"saddle stands above this call's flood ceiling of "
+                f"{ceiling:+.2f} m. Raise ceiling_margin_m rather than reading "
+                "'not measured' as 'agrees'."
+            )
+        if abs(measured - float(expected)) > sill_tolerance_m:
+            raise SillResolutionError(
+                f"this grid resolves the {key[0]}<->{key[1]} sill at "
+                f"{measured:+.2f} m, but it was measured at "
+                f"{float(expected):+.2f} m — a gap of "
+                f"{measured - float(expected):+.2f} m, wider than the "
+                f"{sill_tolerance_m:.2f} m tolerance. A spillway narrower than "
+                "the working pixel is filled in by resampling and the sill rises, "
+                "so a frame built on this grid can report a basin as endorheic "
+                "when the terrain spills. Render at a resolution that resolves the "
+                "channel, or widen sill_tolerance_m in writing."
+            )
+
+    # ── Spill, observed ──────────────────────────────────────────────────────
+    # Two basins are connected iff filling the HIGHER one to its own level reaches
+    # the other one's seed.  The lower basin's own fill can never cross the sill,
+    # so this single directed test is the whole of the symmetric question.
+    component_cache: dict[float, np.ndarray] = {}
+
+    def components(level: float) -> np.ndarray:
+        cached = component_cache.get(level)
+        if cached is None:
+            cached, _ = ndi_label(np.isfinite(dem) & (dem < level))
+            component_cache[level] = cached
+        return cached
+
+    merged_pairs: list[tuple[int, int]] = []
+    for i in range(len(seeds)):
+        for j in range(i + 1, len(seeds)):
+            labelled = components(max(levels[i], levels[j]))
+            a = labelled[seed_rc[i]]
+            if a != 0 and a == labelled[seed_rc[j]]:
+                merged_pairs.append((i, j))
+
+    parent = list(range(len(seeds)))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i, j in merged_pairs:
+        parent[find(i)] = find(j)
+    grouped: dict[int, list[str]] = {}
+    for i, name in enumerate(names):
+        grouped.setdefault(find(i), []).append(name)
+    connected_groups = tuple(sorted(tuple(sorted(g)) for g in grouped.values()))
+
+    # ── Water surface ────────────────────────────────────────────────────────
+    level_lookup = np.concatenate(([np.nan], np.asarray(levels, dtype=np.float64)))
+    water_level = level_lookup[basin_id]
+    corridor_mask = np.zeros(dem.shape, dtype=bool)
+    corridor_mode = "none"
+
+    if merged_pairs:
+        if corridor == "ramp" and len(merged_pairs) > 1:
+            spelled = ", ".join(f"{names[i]}<->{names[j]}" for i, j in merged_pairs)
+            raise CorridorNotRampableError(
+                f"{len(merged_pairs)} basin pairs are connected at this epoch "
+                f"({spelled}). The linear ramp is defined for ONE donor->receiver "
+                "corridor; with several the surface in each depends on how the "
+                "discharge divides, which this module does not model. Pass "
+                "corridor='step' to render every basin flat at its own level with "
+                "the corridors marked."
+            )
+        i, j = merged_pairs[0]
+        donor, receiver = (i, j) if levels[i] >= levels[j] else (j, i)
+        if levels[donor] > levels[receiver]:
+            spill_labels = components(levels[donor])
+            extent = spill_labels == spill_labels[seed_rc[donor]]
+            donor_water = extent & (basin_id == donor + 1)
+            receiver_labels = components(levels[receiver])
+            receiver_water = receiver_labels == receiver_labels[seed_rc[receiver]]
+            candidates = extent & ~donor_water & ~receiver_water
+
+            if candidates.any():
+                if corridor == "step":
+                    corridor_mode = "step"
+                    corridor_mask = candidates
+                else:
+                    corridor_mode = "ramp"
+                    d_donor = _geodesic_hops(candidates, donor_water)
+                    d_receiver = _geodesic_hops(candidates, receiver_water)
+                    reach_d = np.isfinite(d_donor)
+                    reach_r = np.isfinite(d_receiver)
+                    both = reach_d & reach_r
+                    frac = np.full(dem.shape, np.nan)
+                    frac[both] = d_donor[both] / (d_donor[both] + d_receiver[both])
+                    # A pocket that only the donor can reach is a BAY of the donor
+                    # lake and stands at the donor's level; one only the receiver
+                    # can reach never saw the spill at all.
+                    frac[reach_d & ~reach_r] = 0.0
+                    frac[~reach_d & reach_r] = 1.0
+                    ramp = levels[donor] + (levels[receiver] - levels[donor]) * frac
+                    ramped = candidates & np.isfinite(frac)
+                    water_level = np.where(ramped, ramp, water_level)
+                    corridor_mask = ramped & (dem < water_level)
+
+    water_mask = np.isfinite(dem) & (dem < water_level)
+
+    return BasinField(
+        basin_id=basin_id,
+        names=tuple(names),
+        levels_m=tuple(levels),
+        bottleneck_m=bottleneck,
+        water_level_m=water_level,
+        water_mask=water_mask,
+        corridor_mask=corridor_mask,
+        spilling=bool(merged_pairs),
+        connected_groups=connected_groups,
+        sill_m=sill_m,
+        sill_lonlat=sill_lonlat,
+        corridor_mode=corridor_mode,
+        ceiling_m=ceiling,
+    )
 
 
 def build_epoch_mosaic(
@@ -598,6 +1214,11 @@ def render_paleocostline_epoch(
     preloaded_coast_gdf: Optional[gpd.GeoDataFrame] = None,
     sea_level_override_m: Optional[float] = None,
     force_dem_mask: bool = False,
+    basin_seeds: Optional[Sequence[BasinSeed]] = None,
+    basin_ceiling_margin_m: float = 100.0,
+    basin_corridor: str = "ramp",
+    basin_sill_expectations: Optional[dict] = None,
+    basin_sill_tolerance_m: float = 2.0,
 ) -> Path:
     """Render a composite paleo-topography image for one epoch.
 
@@ -645,6 +1266,35 @@ def render_paleocostline_epoch(
         decoupled basin this makes the shoreline follow the cited level continuously
         instead of snapping to the coarse global-eustatic vector steps (which barely
         move across a -30 to -115 m sweep and mix in the wrong open-ocean basin).
+    basin_seeds : sequence of BasinSeed | None
+        **Opt-in multi-basin path.**  ``None`` (default) leaves every line of the
+        single-level behaviour above exactly as it was.  When given, each cell is
+        thresholded against ITS OWN basin's level instead of one scalar, so two
+        basins standing at different levels — the Caspian near +35 m and the Pontic
+        near −30 m — can share one frame, with a ramped water surface across the
+        spillway between them.  See :func:`assign_basins` for how membership, the
+        sill and the spill are derived from the terrain, and for what the corridor
+        ramp is and is not.
+
+        Levels must already be in the paleo-DEM's vertical frame (F1).  This is the
+        DEM-driven path by construction: the vector Paleocoastlines carry one global
+        step per polygon and cannot express two surfaces, so they are not consulted.
+        Mutually exclusive with *sea_level_override_m*.
+
+        A machine-readable sidecar ``<png stem>.basins.json`` is written next to the
+        PNG recording the levels, the measured sill(s), and whether the basins were
+        observed to be spilling — the animation needs that per frame, and a figure
+        is not a data format.
+    basin_ceiling_margin_m : float
+        Passed through to :func:`assign_basins`.
+    basin_corridor : {"ramp", "step"}
+        Passed through to :func:`assign_basins`.
+    basin_sill_expectations, basin_sill_tolerance_m
+        Passed through to :func:`assign_basins`.  **Use them for any frame whose
+        subject is a spillway**: the mosaic this function builds is down-sampled,
+        seam-blended and gaussian-smoothed, and a channel narrower than the
+        resulting pixel is filled in — measured at +13.5 m of spurious sill rise
+        across the Manych.  See :class:`SillResolutionError`.
 
     Returns
     -------
@@ -655,6 +1305,8 @@ def render_paleocostline_epoch(
     ------
     FileNotFoundError
         If no valid tiles are found for this epoch.
+    ValueError
+        If both *basin_seeds* and *sea_level_override_m* are given.
     """
     cfg = config or RenderConfig()
     output_dir = Path(output_dir)
@@ -666,6 +1318,14 @@ def render_paleocostline_epoch(
     # when supplied, REPLACES it for the coastline-step selection only — this is
     # how a sill-dammed basin (e.g. the Black Sea, isolated until ~9 ka) is
     # driven by its own cited level curve instead of the global eustatic curve.
+    if basin_seeds is not None and sea_level_override_m is not None:
+        raise ValueError(
+            "render_paleocostline_epoch got BOTH basin_seeds and "
+            "sea_level_override_m. They are two different answers to 'what is the "
+            "water surface here' and there is no defensible way to combine them: "
+            "put every basin's level in its own BasinSeed."
+        )
+
     spratt_sl = get_sea_level_for_epoch(epoch_ka, sea_level_csv)
 
     if sea_level_override_m is not None:
@@ -675,12 +1335,19 @@ def render_paleocostline_epoch(
         selection_sl = spratt_sl
         sl_source_label = None  # default: label derived from the matched step
 
-    coast_gdf = (
-        preloaded_coast_gdf
-        if preloaded_coast_gdf is not None
-        else load_paleocostlines(paleocoastlines_shp)
-    )
-    land_gdf, coast_level = filter_paleocostlines_for_epoch(coast_gdf, selection_sl)
+    if basin_seeds is None:
+        coast_gdf = (
+            preloaded_coast_gdf
+            if preloaded_coast_gdf is not None
+            else load_paleocostlines(paleocoastlines_shp)
+        )
+        land_gdf, coast_level = filter_paleocostlines_for_epoch(coast_gdf, selection_sl)
+    else:
+        # The vector Paleocoastlines carry ONE global sea-level step per polygon.
+        # A frame with two basins at two levels has no such step, so the vector
+        # path is not "unavailable" here — it is inapplicable, and saying so is
+        # cheaper than loading a shapefile whose answer would be discarded.
+        land_gdf, coast_level = None, None
 
     # ── DEM mosaic ───────────────────────────────────────────────────────────
     dem, ice, xform, bounds, crs, _res = build_epoch_mosaic(tile_paths, cfg)
@@ -725,7 +1392,30 @@ def render_paleocostline_epoch(
         land_gdf, xform, H, W, crs, bounds
     )
 
-    if vector_land is not None:
+    basin_field: Optional[BasinField] = None
+    if basin_seeds is not None:
+        # Ownership, sill and mask are all derived from the SAME array the
+        # single-basin path thresholds (dem_sm), so they cannot disagree.
+        basin_field = assign_basins(
+            dem_sm,
+            xform,
+            basin_seeds,
+            ceiling_margin_m=basin_ceiling_margin_m,
+            corridor=basin_corridor,
+            sill_expectations=basin_sill_expectations,
+            sill_tolerance_m=basin_sill_tolerance_m,
+        )
+        ocean_mask = dem_threshold_ocean(dem_sm, nodata, basin_field.water_level_m)
+        # The de-speckle above is a single-pixel-noise filter; the spill corridor is
+        # the SUBJECT of this frame and a narrow one must not be opened away, so it
+        # is restored verbatim.
+        ocean_mask = ocean_mask | (basin_field.corridor_mask & (~nodata))
+        land_mask = (~nodata) & (~ocean_mask)
+        mask_src = "DEM contour, per-basin: " + " / ".join(
+            f"{name} {level:+.2f} m"
+            for name, level in zip(basin_field.names, basin_field.levels_m)
+        )
+    elif vector_land is not None:
         land_mask = (~nodata) & vector_land
         ocean_mask = (~nodata) & (~vector_land)
         mask_src = f"Paleocoastlines {coast_level:+d} m"
@@ -768,7 +1458,10 @@ def render_paleocostline_epoch(
 
     # Ocean colour — sqrt-stretched depth BELOW THE EPOCH SURFACE (selection_sl),
     # so a lowered decoupled basin reads as shallower, not as deep as today.
-    depth = ocean_depth_from_surface(dem_f, ocean_mask, selection_sl)
+    water_surface = (
+        selection_sl if basin_field is None else basin_field.water_level_m
+    )
+    depth = ocean_depth_from_surface(dem_f, ocean_mask, water_surface)
     if ocean_mask.any():
         max_depth = max(float(np.percentile(depth[ocean_mask], 95)), 1.0)
     else:
@@ -823,7 +1516,7 @@ def render_paleocostline_epoch(
         cb = fig.colorbar(sm, ax=ax, fraction=0.025, pad=0.02, shrink=0.5)
         depth_label = (
             "Depth below basin surface (m)"
-            if sea_level_override_m is not None
+            if (sea_level_override_m is not None or basin_field is not None)
             else "Depth below sea level (m)"
         )
         cb.set_label(depth_label, fontsize=11)
@@ -839,6 +1532,11 @@ def render_paleocostline_epoch(
                       f"  ({mask_src})")),
         Line2D([0], [0], color="#6b8f3a", lw=6, label="Land  (hillshade + terrain)"),
     ]
+    if basin_field is not None:
+        legend_items.append(
+            Line2D([0], [0], color="#2a6db5", lw=6,
+                   label=_basin_legend_label(basin_field))
+        )
     if ice_mask.any():
         legend_items.append(
             Line2D([0], [0], color="#c6e2f7", lw=6,
@@ -864,6 +1562,8 @@ def render_paleocostline_epoch(
             f"{bounds.bottom:.1f}–{bounds.top:.1f}°N"
         ),
     ]
+    if basin_field is not None:
+        title_lines.append(_basin_title_line(basin_field))
     if cfg.extra_figure_title:
         title_lines.append(cfg.extra_figure_title)
     ax.set_title("\n".join(title_lines), fontsize=10, pad=10)
@@ -875,5 +1575,108 @@ def render_paleocostline_epoch(
     out_path = output_dir / f"paleo_render_{epoch_ka}ka.png"
     plt.savefig(out_path, dpi=cfg.dpi, bbox_inches="tight")
     plt.close(fig)
+
+    if basin_field is not None:
+        _write_basin_sidecar(
+            out_path.parent / f"{out_path.stem}.basins.json",
+            epoch_ka,
+            basin_field,
+            nodata,
+        )
+
     gc.collect()
     return out_path.resolve()
+
+
+def _basin_title_line(field: BasinField) -> str:
+    """One-line summary of the multi-basin state, for the figure title."""
+    state = "SPILLING" if field.spilling else "endorheic"
+    groups = " | ".join("+".join(g) for g in field.connected_groups)
+    sills = ", ".join(
+        f"{'~'.join(pair)} sill "
+        + ("above flood ceiling" if not np.isfinite(value) else f"{value:+.2f} m")
+        for pair, value in sorted(field.sill_m.items())
+    )
+    return f"Basins: {state} ({groups})  |  {sills}  |  corridor: {field.corridor_mode}"
+
+
+def _basin_legend_label(field: BasinField) -> str:
+    corridor = {
+        "ramp": "corridor: linear water-surface ramp (not hydraulics)",
+        "step": "corridor: MARKED, not surfaced (step)",
+        "none": "no corridor",
+    }[field.corridor_mode]
+    return f"{'spilling' if field.spilling else 'basins separate'}  ({corridor})"
+
+
+def _write_basin_sidecar(
+    path: Path,
+    epoch_ka: float,
+    field: BasinField,
+    nodata: np.ndarray,
+) -> None:
+    """Record the multi-basin state next to the PNG, machine-readably.
+
+    A figure is not a data format.  The animation needs, per frame, which basins
+    existed, at what level, whether they were connected, and where the sill was —
+    so it is written out rather than left to be re-derived or read off a picture.
+    """
+    valid = int((~nodata).sum())
+    payload = {
+        "epoch_ka": float(epoch_ka),
+        "spilling": bool(field.spilling),
+        "connected_groups": [list(g) for g in field.connected_groups],
+        "flood_ceiling_m": float(field.ceiling_m),
+        "basins": [
+            {
+                "name": name,
+                "level_m": float(level),
+                "cells_owned": int((field.basin_id == i + 1).sum()),
+                "cells_water": int(
+                    (field.water_mask & (field.basin_id == i + 1)).sum()
+                ),
+            }
+            for i, (name, level) in enumerate(zip(field.names, field.levels_m))
+        ],
+        "sills": [
+            {
+                "pair": list(pair),
+                "elevation_m": (None if not np.isfinite(value) else float(value)),
+                "lon": (
+                    None
+                    if field.sill_lonlat.get(pair) is None
+                    else field.sill_lonlat[pair][0]
+                ),
+                "lat": (
+                    None
+                    if field.sill_lonlat.get(pair) is None
+                    else field.sill_lonlat[pair][1]
+                ),
+                "note": (
+                    "measured from this frame's DEM by seeded priority flood; "
+                    "null = the saddle stands above the flood ceiling and was NOT "
+                    "guessed"
+                ),
+            }
+            for pair, value in sorted(field.sill_m.items())
+        ],
+        "corridor": {
+            "mode": field.corridor_mode,
+            "cells": int(field.corridor_mask.sum()),
+            "note": (
+                "ramp = water surface interpolated linearly in along-channel graph "
+                "distance between the donor and receiver levels; it is a "
+                "first-order water-surface profile, NOT a hydraulic model (no "
+                "discharge, no roughness, no backwater). step = every basin flat "
+                "at its own level and the corridor only marked."
+            ),
+        },
+        "valid_cells": valid,
+        "vertical_frame": (
+            "basin levels are consumed AS GIVEN, in the DEM's own frame (F1). No "
+            "frame conversion happens here; see "
+            "Paleo-Europe_3D/docs/superpowers/research/"
+            "2026-07-30-vertical-datum-contract.md"
+        ),
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")

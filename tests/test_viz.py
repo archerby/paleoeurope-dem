@@ -29,6 +29,7 @@ import pytest
 import rasterio
 from rasterio.crs import CRS
 from rasterio.transform import from_bounds
+from scipy.ndimage import gaussian_filter
 from shapely.geometry import box as shp_box
 
 from paleoeurope.viz.paleocostline_render import (
@@ -772,3 +773,448 @@ def test_dem_threshold_ocean_uses_the_water_level_not_zero():
     assert dem_threshold_ocean(dem, nodata, 0.0)[4:-4, 4:-4].all()
     # At level -80 m (basin lowstand): -40 is NOT below -80 -> no ocean anywhere.
     assert not dem_threshold_ocean(dem, nodata, -80.0).any()
+
+
+# ---------------------------------------------------------------------------
+# Two basins at two levels in ONE frame  (basin_seeds / assign_basins)
+# ---------------------------------------------------------------------------
+#
+# Scientific motivation: the hero frame of the Khvalynian project is the Caspian
+# at ~+35 m and the Pontic at ~-30 m rendered SIMULTANEOUSLY, with water crossing
+# the Manych spillway between them.  A single scalar ``sea_level_override_m``
+# cannot express that.  The tests below pin four properties:
+#
+#   1. basin membership is HYDROLOGICAL (a cell belongs to the basin it drains
+#      to), not a bounding box;
+#   2. the spill is OBSERVED FROM THE TERRAIN (the two seeded fills merge), not
+#      asserted from a curve;
+#   3. the corridor between two basins at different levels is a RAMP, not a
+#      vertical wall of blue, and it does not fill the receiving basin to the
+#      donor's level;
+#   4. the single-scalar path is untouched.
+
+from paleoeurope.viz.paleocostline_render import (  # noqa: E402
+    BasinSeed,
+    CorridorNotRampableError,
+    assign_basins,
+)
+
+# Synthetic two-bowl world -------------------------------------------------
+# Two circular cones rising from -100 m at their apices, capped at +300 m:
+#
+#     dem = min(-100 + 4*dist_to_A, -100 + 4*dist_to_B, 300)
+#
+# so the saddle between them sits at the midpoint, where both distances are 35
+# cells: -100 + 4*35 = +40.00 m.  That number is ANALYTIC, not measured off a
+# picture, which is what makes it usable as an expected value for the sill.
+_BASIN_H, _BASIN_W = 60, 160
+_BASIN_BOUNDS = (0.0, 0.0, 16.0, 6.0)          # west, south, east, north
+_BASIN_CELL_DEG = 0.1
+_A_RC, _B_RC = (30, 40), (30, 110)             # bowl apices (row, col)
+_SADDLE_M = 40.0                               # -100 + 4 * 35
+
+
+def _basin_dem() -> np.ndarray:
+    r, c = np.indices((_BASIN_H, _BASIN_W))
+    d_a = np.hypot(r - _A_RC[0], c - _A_RC[1])
+    d_b = np.hypot(r - _B_RC[0], c - _B_RC[1])
+    dem = np.minimum(-100.0 + 4.0 * d_a, -100.0 + 4.0 * d_b)
+    return np.minimum(dem, 300.0)
+
+
+def _basin_transform():
+    return from_bounds(*_BASIN_BOUNDS, width=_BASIN_W, height=_BASIN_H)
+
+
+def _rc_to_lonlat(rc: tuple[int, int]) -> tuple[float, float]:
+    row, col = rc
+    west, south, east, north = _BASIN_BOUNDS
+    return (
+        west + (col + 0.5) * _BASIN_CELL_DEG,
+        north - (row + 0.5) * _BASIN_CELL_DEG,
+    )
+
+
+def _seeds(level_a: float, level_b: float) -> list[BasinSeed]:
+    lon_a, lat_a = _rc_to_lonlat(_A_RC)
+    lon_b, lat_b = _rc_to_lonlat(_B_RC)
+    return [
+        BasinSeed(name="west", lon=lon_a, lat=lat_a, level_m=level_a),
+        BasinSeed(name="east", lon=lon_b, lat=lat_b, level_m=level_b),
+    ]
+
+
+class TestBasinAssignment:
+    """``assign_basins`` -- hydrologically honest membership + observed spill."""
+
+    def test_membership_follows_the_drainage_divide_not_a_bounding_box(self):
+        """Every cell must be owned by the bowl it drains into.  In this world
+        that divide is the column-75 midline, and it is derivable analytically:
+        a cell is closer to A iff it is west of the midline.
+        """
+        dem = _basin_dem()
+        field = assign_basins(dem, _basin_transform(), _seeds(-40.0, -60.0))
+
+        west_id = field.names.index("west") + 1
+        east_id = field.names.index("east") + 1
+        assert field.basin_id[_A_RC] == west_id
+        assert field.basin_id[_B_RC] == east_id
+
+        # Interior of each bowl, well clear of the divide, is owned outright.
+        assert field.basin_id[30, 45] == west_id
+        assert field.basin_id[30, 105] == east_id
+        # A cell EAST of the divide but at the SAME longitude band a bounding
+        # box would hand to the west basin still drains east.
+        assert field.basin_id[30, 80] == east_id
+        assert field.basin_id[30, 70] == west_id
+
+    def test_sill_elevation_is_measured_from_the_terrain(self):
+        """The saddle between the two bowls is analytically +40.00 m; the
+        assignment must recover it from the DEM without being told."""
+        dem = _basin_dem()
+        # Ceiling must clear the saddle, else the flood cannot see it.
+        field = assign_basins(dem, _basin_transform(), _seeds(-40.0, -60.0))
+        assert field.sill_m[("east", "west")] == pytest.approx(_SADDLE_M, abs=0.6)
+        lon, lat = field.sill_lonlat[("east", "west")]
+        assert lon == pytest.approx(7.55, abs=0.25)   # column 75
+        assert lat == pytest.approx(2.95, abs=0.25)   # row 30
+
+    def test_sill_above_the_flood_ceiling_is_reported_as_unknown_not_guessed(self):
+        """If both levels sit so far below the saddle that the flood never
+        reaches it, the sill is NaN -- never a plausible-looking number."""
+        dem = _basin_dem()
+        field = assign_basins(
+            dem, _basin_transform(), _seeds(-40.0, -60.0), ceiling_margin_m=10.0
+        )
+        assert np.isnan(field.sill_m[("east", "west")])
+        assert field.spilling is False
+
+    def test_not_spilling_when_both_levels_are_below_the_sill(self):
+        dem = _basin_dem()
+        field = assign_basins(dem, _basin_transform(), _seeds(20.0, -20.0))
+        assert field.spilling is False
+        assert field.connected_groups == (("east",), ("west",))
+        assert not field.corridor_mask.any()
+        assert field.corridor_mode == "none"
+
+    def test_spilling_is_observed_when_the_donor_level_clears_the_sill(self):
+        dem = _basin_dem()
+        field = assign_basins(dem, _basin_transform(), _seeds(60.0, -20.0))
+        assert field.spilling is True
+        assert field.connected_groups == (("east", "west"),)
+
+    def test_each_basin_is_thresholded_against_its_own_level(self):
+        dem = _basin_dem()
+        field = assign_basins(dem, _basin_transform(), _seeds(20.0, -20.0))
+        west_id = field.names.index("west") + 1
+        east_id = field.names.index("east") + 1
+        assert field.water_level_m[30, 45] == pytest.approx(20.0)
+        assert field.water_level_m[30, 105] == pytest.approx(-20.0)
+        assert field.water_mask[_A_RC] and field.water_mask[_B_RC]
+        # dem == 0 m happens at distance 25 cells from each apex.
+        assert field.basin_id[30, 65] == west_id and dem[30, 65] == pytest.approx(0.0)
+        assert field.water_mask[30, 65]           # 0 < +20 -> west water
+        assert field.basin_id[30, 85] == east_id and dem[30, 85] == pytest.approx(0.0)
+        assert not field.water_mask[30, 85]       # 0 > -20 -> east dry
+
+    def test_determinism(self):
+        dem = _basin_dem()
+        a = assign_basins(dem, _basin_transform(), _seeds(60.0, -20.0))
+        b = assign_basins(dem, _basin_transform(), _seeds(60.0, -20.0))
+        np.testing.assert_array_equal(a.basin_id, b.basin_id)
+        np.testing.assert_allclose(a.water_level_m, b.water_level_m, equal_nan=True)
+
+    def test_seed_off_the_raster_raises(self):
+        dem = _basin_dem()
+        with pytest.raises(ValueError, match="outside"):
+            assign_basins(
+                dem,
+                _basin_transform(),
+                [BasinSeed("nowhere", lon=99.0, lat=0.0, level_m=0.0)],
+            )
+
+    def test_seed_that_is_not_submerged_at_its_own_level_raises(self):
+        """A basin seed must be under its own water.  A seed on dry land silently
+        produces an empty basin, which is exactly the class of quiet wrongness
+        this project refuses."""
+        dem = _basin_dem()
+        with pytest.raises(ValueError, match="above its own level"):
+            assign_basins(dem, _basin_transform(), _seeds(-40.0, -200.0))
+
+    def test_duplicate_basin_names_raise(self):
+        dem = _basin_dem()
+        lon_a, lat_a = _rc_to_lonlat(_A_RC)
+        lon_b, lat_b = _rc_to_lonlat(_B_RC)
+        with pytest.raises(ValueError, match="unique"):
+            assign_basins(
+                dem,
+                _basin_transform(),
+                [
+                    BasinSeed("same", lon_a, lat_a, -40.0),
+                    BasinSeed("same", lon_b, lat_b, -60.0),
+                ],
+            )
+
+
+class TestSpillCorridor:
+    """The water surface between two basins at different levels is a GRADIENT."""
+
+    def test_corridor_is_a_ramp_not_a_step(self):
+        dem = _basin_dem()
+        field = assign_basins(dem, _basin_transform(), _seeds(60.0, -20.0))
+        assert field.corridor_mode == "ramp"
+        assert field.corridor_mask.any()
+
+        ramp = field.water_level_m[field.corridor_mask]
+        # Strictly between the two basin levels, and a genuine spread -- a step
+        # would put every corridor cell at one of the two endpoint values.
+        assert ramp.min() > -20.0
+        assert ramp.max() <= 60.0 + 1e-9
+        assert ramp.max() - ramp.min() > 5.0
+        # Endpoint-exact at the donor end: the first corridor cells past the
+        # sill stand essentially at the donor level.
+        assert ramp.max() > 55.0
+
+    def test_the_ramp_does_not_fill_the_receiving_basin_to_the_donor_level(self):
+        """The failure mode this exists to prevent: flooding the whole receiving
+        basin to the donor's surface because ``dem < donor_level`` is true there.
+        """
+        dem = _basin_dem()
+        field = assign_basins(dem, _basin_transform(), _seeds(60.0, -20.0))
+        far = (30, 135)                      # 25 cells east of the east apex
+        assert dem[far] == pytest.approx(0.0)
+        assert dem[far] < 60.0                # a naive donor-level fill WOULD flood it
+        assert not field.water_mask[far]      # the ramp does not
+        assert field.water_level_m[far] < 0.0
+
+    def test_donor_basin_keeps_its_own_flat_surface(self):
+        dem = _basin_dem()
+        field = assign_basins(dem, _basin_transform(), _seeds(60.0, -20.0))
+        west_id = field.names.index("west") + 1
+        west_water = (
+            field.water_mask & (field.basin_id == west_id) & (~field.corridor_mask)
+        )
+        assert west_water.any()
+        assert np.allclose(field.water_level_m[west_water], 60.0)
+
+    def test_step_mode_marks_the_corridor_instead_of_pretending(self):
+        dem = _basin_dem()
+        field = assign_basins(
+            dem, _basin_transform(), _seeds(60.0, -20.0), corridor="step"
+        )
+        assert field.corridor_mode == "step"
+        # The corridor is MARKED (so a renderer can hatch it) but no cell was
+        # given an invented intermediate surface.
+        assert field.corridor_mask.any()
+        levels = set(np.unique(field.water_level_m[np.isfinite(field.water_level_m)]))
+        assert levels <= {60.0, -20.0}
+
+    def test_more_than_one_spilling_pair_raises_rather_than_guessing(self):
+        """Three basins all merged is a corridor topology this ramp does not
+        model; it must say so instead of drawing something plausible."""
+        dem = _basin_dem()
+        lon_a, lat_a = _rc_to_lonlat(_A_RC)
+        lon_b, lat_b = _rc_to_lonlat(_B_RC)
+        lon_c, lat_c = _rc_to_lonlat((10, 40))
+        seeds = [
+            BasinSeed("west", lon_a, lat_a, 60.0),
+            BasinSeed("east", lon_b, lat_b, -20.0),
+            BasinSeed("north", lon_c, lat_c, 55.0),
+        ]
+        with pytest.raises(CorridorNotRampableError):
+            assign_basins(dem, _basin_transform(), seeds)
+
+
+class TestDemThresholdOceanAcceptsAField:
+    """``dem_threshold_ocean`` must take a per-cell water surface, and must be
+    bit-identical to the scalar call when that surface is constant."""
+
+    def test_constant_field_equals_the_scalar_call(self):
+        rng = np.random.default_rng(3)
+        dem = rng.uniform(-120.0, 40.0, (40, 40))
+        nodata = np.zeros((40, 40), dtype=bool)
+        scalar = dem_threshold_ocean(dem, nodata, -30.0)
+        field = dem_threshold_ocean(dem, nodata, np.full((40, 40), -30.0))
+        np.testing.assert_array_equal(scalar, field)
+
+    def test_a_varying_field_thresholds_per_cell(self):
+        dem = np.full((40, 40), -40.0)
+        nodata = np.zeros((40, 40), dtype=bool)
+        level = np.full((40, 40), -80.0)
+        level[:, 20:] = 0.0
+        out = dem_threshold_ocean(dem, nodata, level)
+        assert not out[4:-4, :16].any()      # -40 is above the -80 surface
+        assert out[4:-4, 24:-4].all()        # -40 is below the 0 m surface
+
+
+class TestRenderTwoBasinsInOneFrame:
+    """End-to-end: one PNG, two basins, two levels, and a machine-readable
+    sidecar recording the spill state observed from the terrain."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, tmp_path: Path):
+        self.csv = tmp_path / "spratt.csv"
+        _write_spratt_csv(
+            self.csv, [(ka * 1000, float(-ka * 5), 2.0) for ka in range(0, 27)]
+        )
+        self.tile = tmp_path / "twobowl_fusion.tif"
+        _write_geotiff(self.tile, _basin_dem().astype("float32"), bounds=_BASIN_BOUNDS)
+        self.outdir = tmp_path / "out"
+        self.cfg = RenderConfig(
+            max_px=_BASIN_W, dpi=40, fig_size_in=4.0, seam_sigma_px=0.1
+        )
+
+    def test_render_writes_png_and_basin_sidecar(self):
+        png = render_paleocostline_epoch(
+            epoch_ka=16.5,
+            tile_paths={str(self.tile): str(self.tile)},
+            sea_level_csv=self.csv,
+            paleocoastlines_shp=self.tile.parent / "nonexistent.shp",
+            output_dir=self.outdir,
+            config=self.cfg,
+            basin_seeds=_seeds(60.0, -20.0),
+        )
+        assert png.exists()
+        sidecar = png.parent / (png.stem + ".basins.json")
+        assert sidecar.exists()
+        import json
+
+        meta = json.loads(sidecar.read_text(encoding="utf-8"))
+        assert meta["spilling"] is True
+        assert meta["corridor"]["mode"] == "ramp"
+        assert {b["name"] for b in meta["basins"]} == {"west", "east"}
+        # The renderer assigns basins on its SMOOTHED DEM (gaussian sigma=1.5 px),
+        # not on the raw tile, and the saddle here is a tent crest of slope
+        # 4 m/cell.  Convolving |x| with a Gaussian lowers the apex by
+        # sigma*sqrt(2/pi) per unit of slope: 4 * 1.5 * 0.7979 = 4.79 m.  So the
+        # measured sill is PREDICTED near +35.2 m, not the raw +40.0 m.  That is a
+        # property of the surface the renderer thresholds on, not an error in the
+        # sill measurement, and it is asserted here as a prediction rather than
+        # back-fitted to the observed value.
+        assert meta["sills"][0]["elevation_m"] == pytest.approx(
+            _SADDLE_M - 4.79, abs=1.0
+        )
+
+    def test_two_levels_render_differently_from_one(self):
+        two = render_paleocostline_epoch(
+            epoch_ka=16.5,
+            tile_paths={str(self.tile): str(self.tile)},
+            sea_level_csv=self.csv,
+            paleocoastlines_shp=self.tile.parent / "nonexistent.shp",
+            output_dir=self.outdir / "two",
+            config=self.cfg,
+            basin_seeds=_seeds(20.0, -20.0),
+        )
+        one = render_paleocostline_epoch(
+            epoch_ka=16.5,
+            tile_paths={str(self.tile): str(self.tile)},
+            sea_level_csv=self.csv,
+            paleocoastlines_shp=self.tile.parent / "nonexistent.shp",
+            output_dir=self.outdir / "one",
+            config=self.cfg,
+            sea_level_override_m=20.0,
+            force_dem_mask=True,
+        )
+        assert two.read_bytes() != one.read_bytes()
+
+    def test_basin_seeds_with_a_scalar_override_raises(self):
+        with pytest.raises(ValueError, match="sea_level_override_m"):
+            render_paleocostline_epoch(
+                epoch_ka=16.5,
+                tile_paths={str(self.tile): str(self.tile)},
+                sea_level_csv=self.csv,
+                paleocoastlines_shp=self.tile.parent / "nonexistent.shp",
+                output_dir=self.outdir,
+                config=self.cfg,
+                basin_seeds=_seeds(20.0, -20.0),
+                sea_level_override_m=-30.0,
+            )
+
+
+# ---------------------------------------------------------------------------
+# The sill the FRAME can resolve vs the sill the TERRAIN has
+# ---------------------------------------------------------------------------
+#
+# Measured on the real Khvalynian raster (2026-08-01), Caspian/Pontic pair:
+#
+#   native 15 arcsec, untouched ................... +25.00 m   <- the terrain
+#   + bilinear downsample to a 2000 px mosaic ..... +30.00 m
+#   + the renderer's dem_sm gaussian sigma=1.5 px . +33.35 m
+#   + build_epoch_mosaic's tile-seam blend at 44E . +38.52 m   <- what a frame sees
+#
+# 13.5 m of purely numerical sill rise, because the Manych spillway is narrower
+# than the render's working pixel.  At a +35 m Khvalynian highstand that flips
+# the frame's spill verdict from SPILLING to endorheic -- silently, and in the
+# direction that deletes the subject of the animation.  `spilling` is only as
+# honest as the DEM it is observed on, so a caller who has measured the sill at
+# native resolution can state it and have the frame refuse to disagree.
+
+from paleoeurope.viz.paleocostline_render import SillResolutionError  # noqa: E402
+
+
+class TestSillResolutionGuard:
+    def test_a_sill_the_grid_cannot_resolve_raises(self):
+        """Smoothing the tent crest lowers it ~4.8 m (see the sidecar test); an
+        expectation pinned to the unsmoothed terrain must then fail loudly."""
+        dem = gaussian_filter(_basin_dem(), sigma=1.5)
+        with pytest.raises(SillResolutionError, match="resolve"):
+            assign_basins(
+                dem,
+                _basin_transform(),
+                _seeds(-40.0, -60.0),
+                sill_expectations={("west", "east"): _SADDLE_M},
+                sill_tolerance_m=2.0,
+            )
+
+    def test_an_expectation_the_frame_agrees_with_is_accepted(self):
+        dem = gaussian_filter(_basin_dem(), sigma=1.5)
+        field = assign_basins(
+            dem,
+            _basin_transform(),
+            _seeds(-40.0, -60.0),
+            sill_expectations={("east", "west"): _SADDLE_M - 4.79},
+            sill_tolerance_m=2.0,
+        )
+        assert np.isfinite(field.sill_m[("east", "west")])
+
+    def test_an_expectation_for_a_sill_above_the_ceiling_raises(self):
+        """"I could not reach that saddle" must not read as "it agrees"."""
+        dem = _basin_dem()
+        with pytest.raises(SillResolutionError, match="ceiling"):
+            assign_basins(
+                dem,
+                _basin_transform(),
+                _seeds(-40.0, -60.0),
+                ceiling_margin_m=10.0,
+                sill_expectations={("west", "east"): _SADDLE_M},
+            )
+
+    def test_an_expectation_naming_an_unknown_basin_raises(self):
+        dem = _basin_dem()
+        with pytest.raises(ValueError, match="not a basin pair"):
+            assign_basins(
+                dem,
+                _basin_transform(),
+                _seeds(-40.0, -60.0),
+                sill_expectations={("west", "danube"): 10.0},
+            )
+
+    def test_the_renderer_passes_the_guard_through(self, tmp_path: Path):
+        csv = tmp_path / "spratt.csv"
+        _write_spratt_csv(csv, [(ka * 1000, float(-ka * 5), 2.0) for ka in range(0, 27)])
+        tile = tmp_path / "twobowl_fusion.tif"
+        _write_geotiff(tile, _basin_dem().astype("float32"), bounds=_BASIN_BOUNDS)
+        with pytest.raises(SillResolutionError):
+            render_paleocostline_epoch(
+                epoch_ka=16.5,
+                tile_paths={str(tile): str(tile)},
+                sea_level_csv=csv,
+                paleocoastlines_shp=tmp_path / "nonexistent.shp",
+                output_dir=tmp_path / "out",
+                config=RenderConfig(
+                    max_px=_BASIN_W, dpi=40, fig_size_in=4.0, seam_sigma_px=0.1
+                ),
+                basin_seeds=_seeds(20.0, -20.0),
+                basin_sill_expectations={("west", "east"): _SADDLE_M},
+                basin_sill_tolerance_m=1.0,
+            )
