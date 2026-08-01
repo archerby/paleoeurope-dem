@@ -824,11 +824,17 @@ class UnconvertibleThresholdError(ValueError):
 
     Raised when the curve row has **no located marker** and **no documented
     locus** — i.e. neither :data:`THRESHOLD_RULES` ``"marker"`` nor ``"locus"``
-    applies and the row is not F4.  Today that is the 10.0 / 9.5 ka pair (whose
-    two scenario columns diverge onto *different* unlocated markers: Giosan's
-    Danube-delta separation surface with no printed coordinates against
-    Lericolais's -100 m dune/terrace with no published shoreline position) and the
-    catastrophic column at 9.0 / 7.5 ka, which carries the same -100 m marker.
+    applies and the row is not F4.
+
+    As of 2026-08-01 **no row of the shipped curve reaches it.**  It used to fire
+    for the 10.0 / 9.5 ka pair and the catastrophic column at 9.0 / 7.5 ka, whose
+    marker_source named Giosan's Danube-delta separation surface and Lericolais's
+    -100 m dune/terrace.  Both papers were then acquired and read in full, and
+    neither prints a coordinate — so ``marker_lon``/``marker_lat`` stay ``UNKNOWN``
+    and those six frames convert by rule ``"locus"`` over the two boxes
+    georeferenced from the papers' own printed graticules (see :data:`_LOCI`).
+    The class stays, and stays reachable, because the next curve row with a new
+    provenance must still hit it rather than borrow somebody else's marker.
 
     The tempting repair — reuse the Bosphorus cell — is exactly the substitution
     the 2026-07-30 marker audit rejected: that cell sits low in the basin's Δz
@@ -878,16 +884,88 @@ _LOCI: dict[str, _Locus] = {
             "interpolated on a DERIVED falling limb and names no site at all"
         ),
     ),
+    "nw_outer_shelf_lericolais_dune_terrace": _Locus(
+        name="nw_outer_shelf_lericolais_dune_terrace",
+        lon_deg=(29.5, 31.0),
+        lat_deg=(43.5, 44.5),
+        modern_depth_m=(-115.0, -90.0),
+        why=(
+            "the Romanian outer shelf at the head of the Danube (Viteaz) canyon, "
+            "where Lericolais; Bulois; Gillet & Guichard 2009 (Global Planet. "
+            "Change 66:65-75) map the -100 m dune field and the wave-cut terrace "
+            "that the -100 m catastrophic-column rows ARE.  THE PAPER PRINTS NO "
+            "COORDINATE - established by reading it in full, not assumed: it says "
+            "only that 'A Differential GPS system was deployed for accurate "
+            "(about 1 m) positioning', and no lon/lat appears in text, table or "
+            "caption.  This box is georeferenced from the printed graticule of its "
+            "Fig. 2.  IT IS DELIBERATELY WIDER THAN THE PUBLISHED MOSAIC: the "
+            "pseudo-3D mosaic is 20x5 km at 30d00'-30d15' E / 43d53'-43d54' N, "
+            "SMALLER THAN ONE 10-arcmin ICE-6G cell, and holds exactly 1 usable "
+            "cell - below locus_solid_displacement's minimum of 5, so a median and "
+            "a p5-p95 bar over the mosaic alone would be a fiction.  The widening "
+            "follows the terrace segment the paper itself describes ('-98 m to "
+            "-112 m around the head of the Danube (Viteaz) canyon', '-97 m north "
+            "of it'), and it does NOT move the answer: the widened median tracks "
+            "the single cell under the mosaic (30.1667 E / 43.9167 N) to "
+            "-0.114 / -0.110 / -0.103 / -0.080 m at 10.0 / 9.5 / 9.0 / 7.5 ka, "
+            "n=7 cells at every epoch"
+        ),
+    ),
+    "danube_delta_separation_surface": _Locus(
+        name="danube_delta_separation_surface",
+        lon_deg=(28.8, 30.0),
+        lat_deg=(44.6, 45.4),
+        modern_depth_m=(-45.0, 5.0),
+        why=(
+            "the Danube delta plain and its adjacent inner shelf - the extent of "
+            "the borehole network and of the 25-35 mbsl lacustrine/marine "
+            "separation surface contoured in Giosan; Filip & Constantinescu 2009 "
+            "(Quat. Sci. Rev. 28:1-6) Fig. 2b, which is what the -30 m gradual "
+            "rows are.  THE PAPER PRINTS NO COORDINATE - established by reading it "
+            "in full: its Table I is radiocarbon ages, and the new drill core is a "
+            "filled dot on Figs. 1-2.  This box is georeferenced by linear "
+            "interpolation off that figure's printed 29d/30d and 45d/44.5d "
+            "graticule ticks, so its precision is about +/-0.05 deg (~5 km) and no "
+            "better; an area georeferenced this way is a LOCUS and is never "
+            "written into marker_lon/marker_lat.  CHECK: the same interpolation "
+            "puts the CV/958 drill core at ~29.75 E / 45.0 N - the St. George / "
+            "Sulina coast the text independently places it on.  The depth band "
+            "spans the shoreline (-45 m to +5 m) because the separation surface is "
+            "buried under the subaerial delta as well as under the inner shelf"
+        ),
+    ),
 }
 
 #: ``marker_source`` prefix -> locus.  Keyed on the prefix (not the epoch) so the
 #: mapping is a statement about the KIND of provenance, and a re-run of
 #: ``_build_bs_curve.py`` that renumbers rows cannot silently repoint it.
 #: Anything not listed here has no documented locus and RAISES.
+#:
+#: The last four entries close the 10.5-7.5 ka window (2026-08-01).  Note that the
+#: window is **three** provenances, not one: the papers disagree about the
+#: CONTROVERSY (-30 m Giosan vs -100 m Lericolais) but two of its rows carry
+#: NEITHER number, so charging them to either paper would be a fabrication —
+#:
+#:   * ``bracket_midpoint_held_flat`` (10.5 / 10.0 ka, BOTH columns) reads -80 m,
+#:     which is neither -30 nor -100: it is the 10.9 ka central value clamped flat
+#:     by ``interp_dict``, and that -80 is itself the midpoint of BLVK9814's
+#:     measured -55 mbsl ceiling and the -100 m lowstand, i.e. from no source.  A
+#:     midpoint of two markers ~45 m apart in depth has no marker →
+#:     ``basin_shelf_band``.  This is WHY both 10.0 ka columns get the SAME
+#:     threshold; splitting them onto Giosan vs Lericolais would manufacture a
+#:     ~3.9 m difference out of an attribution neither column's -80 m supports.
+#:   * ``gradual_tail_ramp`` (9.5 ka gradual) is -40 m, a hand-set ``grad_tail``
+#:     value in ``_build_bs_curve.py`` ramping to the 9.4 ka reconnection.  No
+#:     source measures it → ``basin_shelf_band``.
+#:   * the two paper loci below are the rows that DO carry a cited number.
 _MARKER_SOURCE_LOCI: tuple[tuple[str, str], ...] = (
     ("UNKNOWN:seismic_lowstand_wedge", "nw_outer_shelf_seismic_wedge"),
     ("UNKNOWN:interpolated_on_the_DERIVED_falling_limb", "basin_shelf_band"),
     ("UNKNOWN:DERIVED_anchor_source_gives_no_absolute_level", "basin_shelf_band"),
+    ("UNKNOWN:lericolais2009_nw_outer_shelf", "nw_outer_shelf_lericolais_dune_terrace"),
+    ("UNKNOWN:giosan2009_danube_delta", "danube_delta_separation_surface"),
+    ("UNKNOWN:bracket_midpoint_held_flat", "basin_shelf_band"),
+    ("UNKNOWN:gradual_tail_ramp", "basin_shelf_band"),
 )
 
 #: Curve columns the conversion needs.  Added to the CSV 2026-07-30; a curve
@@ -1138,8 +1216,11 @@ def pontic_threshold(
     Raises
     ------
     UnconvertibleThresholdError
-        No marker and no documented locus (today: 10.0 and 9.5 ka in both columns,
-        and the catastrophic column at 9.0 and 7.5 ka).
+        No marker and no documented locus.  **No row of the shipped curve is in
+        that state as of 2026-08-01** — the last six that were (10.0 and 9.5 ka in
+        both columns, and the catastrophic column at 9.0 and 7.5 ka) now resolve
+        by ``locus``, because the two papers behind them were read and their
+        figures' graticules yielded documented AREAS, not coordinates.
     ValueError
         Unknown scenario, a curve without the marker columns, or a converted
         threshold outside :data:`_THRESHOLD_SANITY_RANGE_M`.

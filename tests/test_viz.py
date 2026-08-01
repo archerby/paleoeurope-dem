@@ -35,9 +35,11 @@ from shapely.geometry import box as shp_box
 from paleoeurope.viz.paleocostline_render import (
     RenderConfig,
     SeaLevelCurveResolutionError,
+    SeamBlendShiftWarning,
     build_epoch_mosaic,
     filter_paleocostlines_for_epoch,
     get_sea_level_for_epoch,
+    interior_tile_seams,
     load_paleocostlines,
     rasterize_land_mask,
     render_paleocostline_epoch,
@@ -1135,19 +1137,27 @@ class TestRenderTwoBasinsInOneFrame:
 # The sill the FRAME can resolve vs the sill the TERRAIN has
 # ---------------------------------------------------------------------------
 #
-# Measured on the real Khvalynian raster (2026-08-01), Caspian/Pontic pair:
+# Measured on the real Khvalynian raster, Manych point sill 44.119E / 45.773N,
+# through build_epoch_mosaic itself:
 #
-#   native 15 arcsec, untouched ................... +25.00 m   <- the terrain
-#   + bilinear downsample to a 2000 px mosaic ..... +30.00 m
-#   + the renderer's dem_sm gaussian sigma=1.5 px . +33.35 m
-#   + build_epoch_mosaic's tile-seam blend at 44E . +38.52 m   <- what a frame sees
+#                                             max_px=2000   max_px=4000
+#   native 15 arcsec, untouched ............. +23.00 m       +23.00 m  <- the terrain
+#   + bilinear downsample to the mosaic ..... +24.00 m       +25.00 m
+#   + the seam blend as it stood 2026-08-01 . +40.76 m       +30.57 m  <- the frame
 #
-# 13.5 m of purely numerical sill rise, because the Manych spillway is narrower
-# than the render's working pixel.  At a +35 m Khvalynian highstand that flips
-# the frame's spill verdict from SPILLING to endorheic -- silently, and in the
-# direction that deletes the subject of the animation.  `spilling` is only as
-# honest as the DEM it is observed on, so a caller who has measured the sill at
-# native resolution can state it and have the frame refuse to disagree.
+# The last row is gone: that blend ran along every whole degree line whether or
+# not a tile boundary was there, and the single-file inputs both bakes pass have
+# no seams at all (see TestSeamBlendDoesNotMoveTheManychCrest).  What is left is
+# the honest cost of downsampling a spillway narrower than the working pixel,
+# +1.00 m and +2.00 m, and the renderer's own dem_sm gaussian on top of it.
+#
+# The 16.76 m that used to ride along was the dangerous part: at a +35 m
+# Khvalynian highstand it flips the frame's spill verdict from SPILLING to
+# endorheic -- silently, and in the direction that deletes the subject of the
+# animation.  `spilling` is only as honest as the DEM it is observed on, so a
+# caller who has measured the sill at native resolution can state it and have the
+# frame refuse to disagree -- which is the guard that stays put whether or not any
+# one smoothing step is currently behaving.
 
 from paleoeurope.viz.paleocostline_render import SillResolutionError  # noqa: E402
 
@@ -1217,4 +1227,337 @@ class TestSillResolutionGuard:
                 basin_seeds=_seeds(20.0, -20.0),
                 basin_sill_expectations={("west", "east"): _SADDLE_M},
                 basin_sill_tolerance_m=1.0,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Three basins in a line: connectivity must be a DONOR-level flood
+# ---------------------------------------------------------------------------
+#
+# The hero frame is a THREE-basin configuration -- Caspian, Pontic, Mediterranean
+# -- and the pairwise test ``dem < max(level_i, level_j)`` manufactures a
+# connection across it.  Flooding to the pairwise max floods every basin in
+# BETWEEN to the donor's level as well, so a Caspian at +35 m "reaches" the
+# Mediterranean straight through a Pontic basin standing 65 m lower, whatever the
+# Bosphorus sill does.  The frame then reports two spilling pairs and
+# ``corridor="ramp"`` refuses to draw it at all.
+#
+# The world below is that configuration reduced to its analytic bones: a channel
+# with three bowls at -100 m separated by two crests, +20 m between caspian and
+# pontic and +5 m between pontic and mediterranean.  Every number in it is a
+# control point of the profile, not something read off a picture.
+#
+#   caspian  +35 m  clears the +20 m crest  -> spills into pontic
+#   pontic   -30 m  is BELOW the +5 m crest -> does not spill into mediterranean
+#   caspian  +35 m  is above BOTH crests    -> the old pairwise test connected it
+#                                              to the mediterranean as well
+
+import itertools  # noqa: E402
+
+_CHAIN_H, _CHAIN_W = 40, 180
+_CHAIN_BOUNDS = (0.0, 0.0, 18.0, 4.0)          # 0.1 deg cells, both axes
+_CHAIN_CELL_DEG = 0.1
+#                     col    elevation
+_CHAIN_PROFILE = ((0, 300.0), (30, -100.0), (60, 20.0), (90, -100.0),
+                  (120, 5.0), (150, -100.0), (179, 300.0))
+_CHAIN_SEED_COL = {"caspian": 30, "pontic": 90, "mediterranean": 150}
+_CHAIN_SEED_ROW = 20
+_CHAIN_CREST_CASPIAN_PONTIC_M = 20.0
+_CHAIN_CREST_PONTIC_MED_M = 5.0
+_CHAIN_LEVELS = {"caspian": 35.0, "pontic": -30.0, "mediterranean": -45.0}
+
+
+def _chain_dem() -> np.ndarray:
+    cols = [c for c, _ in _CHAIN_PROFILE]
+    elev = [e for _, e in _CHAIN_PROFILE]
+    profile = np.interp(np.arange(_CHAIN_W, dtype=float), cols, elev)
+    return np.tile(profile, (_CHAIN_H, 1))
+
+
+def _chain_transform():
+    return from_bounds(*_CHAIN_BOUNDS, width=_CHAIN_W, height=_CHAIN_H)
+
+
+def _chain_seeds() -> list[BasinSeed]:
+    west, _south, _east, north = _CHAIN_BOUNDS
+    return [
+        BasinSeed(
+            name=name,
+            lon=west + (_CHAIN_SEED_COL[name] + 0.5) * _CHAIN_CELL_DEG,
+            lat=north - (_CHAIN_SEED_ROW + 0.5) * _CHAIN_CELL_DEG,
+            level_m=_CHAIN_LEVELS[name],
+        )
+        for name in ("caspian", "pontic", "mediterranean")
+    ]
+
+
+class TestSpillIsADonorLevelFloodNotAPairwiseMax:
+    """Connectivity must never flood an intermediate basin to the donor's level."""
+
+    def test_a_high_donor_does_not_connect_through_an_intermediate_basin(self):
+        """The whole three-basin hero frame in one assertion.
+
+        caspian spills into pontic across the +20 m crest, and STOPS there: the
+        water it delivers joins the pontic water body at the pontic's own -30 m
+        surface, which is 35 m below the +5 m crest to the mediterranean.  Under
+        the pairwise-max rule this frame reported TWO spilling pairs and
+        ``corridor='ramp'`` raised rather than render.
+        """
+        field = assign_basins(_chain_dem(), _chain_transform(), _chain_seeds())
+        assert field.spilling is True
+        assert field.connected_groups == (("caspian", "pontic"), ("mediterranean",))
+        assert field.corridor_mode == "ramp"
+
+    def test_the_verdict_does_not_depend_on_the_order_the_basins_are_listed(self):
+        seeds = _chain_seeds()
+        dem, xform = _chain_dem(), _chain_transform()
+        reference = assign_basins(dem, xform, seeds)
+        for order in itertools.permutations(range(3)):
+            field = assign_basins(dem, xform, [seeds[i] for i in order])
+            assert field.spilling == reference.spilling
+            assert field.connected_groups == reference.connected_groups
+            assert field.sill_m.keys() == reference.sill_m.keys()
+            for pair, expected in reference.sill_m.items():
+                # NaN == NaN is False, and "this saddle was never reached" is a
+                # verdict that has to survive a re-ordering just like a number.
+                assert field.sill_m[pair] == pytest.approx(expected, nan_ok=True)
+
+    def test_the_uninvolved_basin_keeps_its_own_water_surface(self):
+        """A basin that is neither donor nor receiver must not be repainted by the
+        corridor ramp.  The mediterranean stands at -45 m; the ramp interpolates
+        between +35 m and -30 m and would put it 15 m too high.
+        """
+        field = assign_basins(_chain_dem(), _chain_transform(), _chain_seeds())
+        med = field.basin_id == (field.names.index("mediterranean") + 1)
+        assert med.any()
+        assert np.allclose(field.water_level_m[med], _CHAIN_LEVELS["mediterranean"])
+        assert not field.corridor_mask[med].any()
+
+    def test_the_two_crests_are_measured_and_the_far_pair_never_touches(self):
+        field = assign_basins(_chain_dem(), _chain_transform(), _chain_seeds())
+        assert field.sill_m[("caspian", "pontic")] == pytest.approx(
+            _CHAIN_CREST_CASPIAN_PONTIC_M, abs=0.5
+        )
+        assert field.sill_m[("mediterranean", "pontic")] == pytest.approx(
+            _CHAIN_CREST_PONTIC_MED_M, abs=0.5
+        )
+        # The pontic basin lies bodily between them, so these two territories have
+        # no common border and there is no saddle to report.
+        assert np.isnan(field.sill_m[("caspian", "mediterranean")])
+
+    def test_a_pontic_high_enough_to_clear_its_own_crest_does_connect_onward(self):
+        """The rule must not be "never transitive" -- it must be "each hop on its
+        own level".  Raise the pontic above the +5 m crest and the three become one
+        connected group through TWO genuine corridors (which ramp mode then refuses,
+        by design, rather than guessing how the discharge divides).
+        """
+        seeds = [
+            BasinSeed(s.name, s.lon, s.lat, 10.0 if s.name == "pontic" else s.level_m)
+            for s in _chain_seeds()
+        ]
+        field = assign_basins(_chain_dem(), _chain_transform(), seeds, corridor="step")
+        assert field.connected_groups == (("caspian", "mediterranean", "pontic"),)
+
+
+# ---------------------------------------------------------------------------
+# The seam blend must not move a sill
+# ---------------------------------------------------------------------------
+#
+# ``build_epoch_mosaic`` used to Gaussian-blur a strip of +/-3 sigma around EVERY
+# integer degree line inside the mosaic, whether or not a tile boundary was there.
+# On the single-file inputs both bakes actually pass, that is pure interior
+# smoothing, and measured on the real working raster
+# (``gebco_2024_khvalynian_pontic_...cog.tif``, 2026-08-01) it moved the Manych
+# point sill at 44.119 E / 45.773 N by
+#
+#     max_px=2000 (the Pontic bake's own setting) : +24.00 m -> +40.76 m
+#     max_px=4000                                 : +25.00 m -> +30.57 m
+#
+# and changed 41-75 % of all mosaic cells by more than a centimetre.  A +16.76 m
+# rise turns a Caspian spilling over a +23.00 m sill at a +35 m highstand into an
+# endorheic lake -- silently, and in the direction that deletes the subject of the
+# animation.
+
+_MANYCH_LON, _MANYCH_LAT = 44.119, 45.773
+_MANYCH_SILL_M = 23.00
+_MANYCH_BOUNDS = (43.0, 45.0, 45.5, 46.5)      # west, south, east, north
+_MANYCH_W, _MANYCH_H = 160, 96                 # -> 0.015625 deg/px, both axes
+_MANYCH_ROW, _MANYCH_COL = 46, 71              # the cell holding the sill point
+_MANYCH_SHOULDER_M = 80.0
+
+
+def _manych_dem() -> np.ndarray:
+    """A narrow E-W channel with an analytic crest at the real Manych point.
+
+    The channel is three cells tall -- the Manych spillway really is narrower than
+    a 0.015625 deg working pixel is comfortable with -- and its floor is a tent of
+    slope 6 m/px peaking at exactly ``_MANYCH_SILL_M`` in cell
+    ``(_MANYCH_ROW, _MANYCH_COL)``, which is the cell containing 44.119 E /
+    45.773 N.  Nothing here is measured off a picture.
+    """
+    dem = np.full((_MANYCH_H, _MANYCH_W), _MANYCH_SHOULDER_M, dtype="float32")
+    cols = np.arange(_MANYCH_W)
+    floor = np.maximum(_MANYCH_SILL_M - 6.0 * np.abs(cols - _MANYCH_COL), -60.0)
+    dem[_MANYCH_ROW - 1 : _MANYCH_ROW + 2, :] = floor.astype("float32")
+    return dem
+
+
+class TestSeamBlendDoesNotMoveTheManychCrest:
+    @pytest.fixture()
+    def manych_tile(self, tmp_path: Path) -> Path:
+        p = tmp_path / "manych_fusion.tif"
+        _write_geotiff(p, _manych_dem(), bounds=_MANYCH_BOUNDS)
+        return p
+
+    def test_the_sill_point_really_is_the_crest_of_the_raw_raster(self):
+        """Guard the fixture itself: the number the mosaic is pinned against has
+        to be a property of the raster, not of the test's arithmetic."""
+        dem = _manych_dem()
+        assert dem[_MANYCH_ROW, _MANYCH_COL] == pytest.approx(_MANYCH_SILL_M)
+        channel = dem[_MANYCH_ROW - 1 : _MANYCH_ROW + 2, :]
+        assert channel.max() == pytest.approx(_MANYCH_SILL_M)
+        # The sill point really is where the fixture says it is.
+        xform = from_bounds(*_MANYCH_BOUNDS, width=_MANYCH_W, height=_MANYCH_H)
+        col_f, row_f = ~xform * (_MANYCH_LON, _MANYCH_LAT)
+        assert (int(row_f), int(col_f)) == (_MANYCH_ROW, _MANYCH_COL)
+
+    def test_a_single_file_mosaic_reproduces_the_manych_crest_exactly(
+        self, manych_tile: Path
+    ):
+        """A single file has no seams, so the mosaic must BE the raster."""
+        cfg = RenderConfig(max_px=_MANYCH_W)          # native resolution, no resample
+        dem, _ice, _xf, _bnds, _crs, _res = build_epoch_mosaic(
+            {"m": str(manych_tile)}, cfg
+        )
+        assert dem.shape == (_MANYCH_H, _MANYCH_W)
+        assert dem[_MANYCH_ROW, _MANYCH_COL] == pytest.approx(_MANYCH_SILL_M, abs=1e-4)
+        np.testing.assert_allclose(dem, _manych_dem(), rtol=0, atol=1e-4)
+
+    def test_the_legacy_degree_grid_blend_is_what_moved_the_crest(
+        self, manych_tile: Path
+    ):
+        """The defect, pinned as a measurement rather than described in prose.
+
+        43-45 E and 45-46 N all cross this window, the sill point sits 7.6 px from
+        the 44 E line and 14.5 px from the 46 N line, and sigma=5 px reaches 15 px
+        -- so the old rule blurred the shoulders straight into the spillway.
+        """
+        cfg = RenderConfig(max_px=_MANYCH_W, legacy_degree_grid_blend=True)
+        with pytest.warns(SeamBlendShiftWarning):
+            dem, *_ = build_epoch_mosaic({"m": str(manych_tile)}, cfg)
+        risen = float(dem[_MANYCH_ROW, _MANYCH_COL])
+        # Far more than the 2 m the project's own SillResolutionError tolerates.
+        assert risen > _MANYCH_SILL_M + 5.0
+
+    def test_a_zero_seam_sigma_no_longer_crashes(self, manych_tile: Path):
+        """The mitigation a previous step wrote down -- "pass a small
+        seam_sigma_px" -- dies with ZeroDivisionError deep inside scipy at the one
+        value that actually means "do not blend"."""
+        cfg = RenderConfig(max_px=_MANYCH_W, seam_sigma_px=0.0)
+        dem, *_ = build_epoch_mosaic({"m": str(manych_tile)}, cfg)
+        np.testing.assert_allclose(dem, _manych_dem(), rtol=0, atol=1e-4)
+
+    def test_a_negative_seam_sigma_is_refused_in_words(self, manych_tile: Path):
+        cfg = RenderConfig(max_px=_MANYCH_W, seam_sigma_px=-1.0)
+        with pytest.raises(ValueError, match="seam_sigma_px"):
+            build_epoch_mosaic({"m": str(manych_tile)}, cfg)
+
+
+_SEAM_COL = 110                                # -> 44.71875 E, 39 px east of the sill
+_SEAM_LON = _MANYCH_BOUNDS[0] + _SEAM_COL * 0.015625
+_SEAM_STEP_M = 12.0                            # the tile disagreement a blend hides
+
+
+def _manych_two_tile_raw() -> np.ndarray:
+    """The Manych window as two tiles that disagree by ``_SEAM_STEP_M`` at the seam.
+
+    A seam blend exists to hide a step like this.  It is put 39 px east of the
+    sill point so that "blend the seam" and "leave the sill alone" are separable
+    claims rather than the same claim.
+    """
+    raw = _manych_dem().copy()
+    raw[:, _SEAM_COL:] += np.float32(_SEAM_STEP_M)
+    return raw
+
+
+class TestSeamBlendIsSeamLocalAndAudited:
+    @pytest.fixture()
+    def abutting_tiles(self, tmp_path: Path) -> list[Path]:
+        """Two tiles sharing the 44.71875 E edge; the Manych channel crosses both.
+
+        The shared edge is deliberately NOT a whole degree: a seam is where the
+        tiles are.  The old rule could not see one that failed to land on a whole
+        degree any more than it could avoid one that was not there at all.
+        """
+        raw = _manych_two_tile_raw()
+        a = tmp_path / "left.tif"
+        b = tmp_path / "right.tif"
+        _write_geotiff(a, raw[:, :_SEAM_COL], bounds=(43.0, 45.0, _SEAM_LON, 46.5))
+        _write_geotiff(b, raw[:, _SEAM_COL:], bounds=(_SEAM_LON, 45.0, 45.5, 46.5))
+        return [a, b]
+
+    def test_the_seam_is_found_from_the_tiles_not_from_the_degree_grid(
+        self, abutting_tiles: list[Path]
+    ):
+        from rasterio.coords import BoundingBox
+
+        tiles = [BoundingBox(43.0, 45.0, _SEAM_LON, 46.5),
+                 BoundingBox(_SEAM_LON, 45.0, 45.5, 46.5)]
+        lons, lats = interior_tile_seams(
+            tiles, BoundingBox(43.0, 45.0, 45.5, 46.5), 0.015625
+        )
+        assert lons == [pytest.approx(_SEAM_LON)]
+        assert lats == []          # both tiles span the full latitude range
+        # A single tile has no interior edge at all, whatever its extent.
+        assert interior_tile_seams(
+            [BoundingBox(43.0, 45.0, 45.5, 46.5)],
+            BoundingBox(43.0, 45.0, 45.5, 46.5),
+            0.015625,
+        ) == ([], [])
+
+    def test_a_genuine_seam_is_still_blended_but_only_near_the_seam(
+        self, abutting_tiles: list[Path]
+    ):
+        cfg = RenderConfig(max_px=_MANYCH_W)
+        with pytest.warns(SeamBlendShiftWarning):
+            dem, *_ = build_epoch_mosaic({str(p): str(p) for p in abutting_tiles}, cfg)
+        raw = _manych_two_tile_raw()
+        hw = int(np.ceil(cfg.seam_sigma_px * 3))
+        # Blended where the tiles meet ...
+        assert not np.allclose(
+            dem[:, _SEAM_COL - 2 : _SEAM_COL + 2],
+            raw[:, _SEAM_COL - 2 : _SEAM_COL + 2],
+        )
+        # ... and untouched everywhere else, the Manych crest included.
+        np.testing.assert_allclose(
+            dem[:, : _SEAM_COL - hw], raw[:, : _SEAM_COL - hw], rtol=0, atol=1e-4
+        )
+        np.testing.assert_allclose(
+            dem[:, _SEAM_COL + hw + 1 :],
+            raw[:, _SEAM_COL + hw + 1 :],
+            rtol=0,
+            atol=1e-4,
+        )
+        assert dem[_MANYCH_ROW, _MANYCH_COL] == pytest.approx(_MANYCH_SILL_M, abs=1e-4)
+
+    def test_the_shift_a_blend_causes_is_reported_with_a_number_and_a_place(
+        self, abutting_tiles: list[Path]
+    ):
+        cfg = RenderConfig(max_px=_MANYCH_W)
+        with pytest.warns(SeamBlendShiftWarning) as record:
+            build_epoch_mosaic({str(p): str(p) for p in abutting_tiles}, cfg)
+        message = str(record[0].message)
+        assert " m at " in message and " E / " in message and " N" in message
+        assert "seam_blend_max_shift_m" in message
+
+    def test_a_blend_that_stays_inside_its_bound_says_nothing(self, tmp_path: Path):
+        flat = np.full((_MANYCH_H, _MANYCH_W), 12.0, dtype="float32")
+        a = tmp_path / "flat_left.tif"
+        b = tmp_path / "flat_right.tif"
+        _write_geotiff(a, flat[:, :_SEAM_COL], bounds=(43.0, 45.0, _SEAM_LON, 46.5))
+        _write_geotiff(b, flat[:, _SEAM_COL:], bounds=(_SEAM_LON, 45.0, 45.5, 46.5))
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", SeamBlendShiftWarning)
+            build_epoch_mosaic(
+                {str(a): str(a), str(b): str(b)}, RenderConfig(max_px=_MANYCH_W)
             )

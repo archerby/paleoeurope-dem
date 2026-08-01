@@ -1398,22 +1398,46 @@ def test_every_locus_row_carries_its_own_p5_p95_bracket():
 # --- the rule that matters most: no marker, no locus -> RAISE ---------------
 
 
+def _unregistered_marker_source_df():
+    """A curve row whose ``marker_source`` matches no prefix in the table.
+
+    This test used to pin the refusal on the REAL 10 / 9.5 ka rows.  On 2026-08-01
+    those rows got documented loci (the two papers were read; neither prints a
+    coordinate, so they yielded AREAS), and the shipped curve now contains no
+    unconvertible row at all.  Pinning the refusal on a synthetic row keeps the
+    rule itself under test without freezing the curve's current contents — a
+    future row with a new provenance must still hit it.
+    """
+    return pd.DataFrame(
+        {
+            "age_ka": [9.0, 0.0],
+            "level_m_global_gradual": [-35.0, 0.0],
+            "level_m_global_catastrophic": [-100.0, 0.0],
+            "marker_lon": ["UNKNOWN", "NOT_APPLICABLE"],
+            "marker_lat": ["UNKNOWN", "NOT_APPLICABLE"],
+            "marker_source": [
+                "UNKNOWN:a_provenance_nobody_has_registered_a_locus_for",
+                "NOT_APPLICABLE_F4_Spratt",
+            ],
+        }
+    )
+
+
 def test_a_row_with_neither_marker_nor_locus_raises_rather_than_substituting():
-    """10 / 9.5 ka: the two columns diverge onto DIFFERENT unlocated markers."""
     _real_ice6g_epochs_or_skip()
-    df = _real_pontic_df()
-    for epoch in (10, 9.5):
-        for scenario in b.SCENARIOS:
-            with pytest.raises(b.UnconvertibleThresholdError) as exc:
-                b.pontic_threshold(df, epoch, scenario)
-            assert "marker" in str(exc.value).lower(), (epoch, scenario)
+    df = _unregistered_marker_source_df()
+    for scenario in b.SCENARIOS:
+        with pytest.raises(b.UnconvertibleThresholdError) as exc:
+            b.pontic_threshold(df, 9.0, scenario)
+        assert "marker" in str(exc.value).lower(), scenario
+        assert "locus" in str(exc.value).lower(), scenario
 
 
 def test_the_bosphorus_cell_is_never_substituted_for_an_unlocated_row():
     """The audited failure mode: that substitution is systematically one-signed."""
     _real_ice6g_epochs_or_skip()
     with pytest.raises(b.UnconvertibleThresholdError):
-        b.pontic_threshold(_real_pontic_df(), 10, "gradual")
+        b.pontic_threshold(_unregistered_marker_source_df(), 9.0, "gradual")
     src = inspect.getsource(b.pontic_threshold)
     assert "over-flood" in src.lower() or "one-signed" in src.lower()
 
@@ -1441,9 +1465,15 @@ def test_a_mixed_row_is_resolved_per_scenario_not_per_row():
     """9 ka: gradual is already marine (F4); catastrophic is still a deep F2 lake."""
     _real_ice6g_epochs_or_skip()
     df = _real_pontic_df()
-    assert b.pontic_threshold(df, 9, "gradual").rule == "ocean_offset"
-    with pytest.raises(b.UnconvertibleThresholdError):
-        b.pontic_threshold(df, 9, "catastrophic")
+    grad = b.pontic_threshold(df, 9, "gradual")
+    cat = b.pontic_threshold(df, 9, "catastrophic")
+    assert (grad.rule, grad.frame) == ("ocean_offset", "F4")
+    # The catastrophic column used to RAISE here; since 2026-08-01 it converts
+    # over Lericolais's dune/terrace locus.  The point of the test is unchanged:
+    # one row, two frames, resolved per COLUMN and never per row.
+    assert (cat.rule, cat.frame) == ("locus", "F2")
+    assert "nw_outer_shelf_lericolais_dune_terrace" in cat.provenance
+    assert cat.threshold_m < grad.threshold_m - 50.0
 
 
 def test_offset_is_zero_at_present_by_construction():
@@ -1573,3 +1603,169 @@ def test_spratt_csv_content_is_pinned_without_needing_the_noaa_file():
     )
     got = hashlib.sha256(canon.encode("ascii")).hexdigest()
     assert got == _SPRATT_CANONICAL_SHA256
+
+
+# ===========================================================================
+# FIX 1 - the 10.5-7.5 ka window's LOCI are registered, so the six frames that
+# used to refuse now convert.
+#
+# Both papers behind that window were acquired and read in full on 2026-08-01
+# (Giosan, Filip & Constantinescu 2009 QSR 28:1-6; Lericolais, Bulois, Gillet &
+# Guichard 2009 GPC 66:65-75).  NEITHER PRINTS A COORDINATE - confirmed by
+# reading - so marker_lon/marker_lat stay the literal UNKNOWN and the fallback
+# stays rule="locus", never rule="marker".  What the read bought is two
+# DOCUMENTED AREAS, georeferenced off each paper's own printed graticule.
+# ===========================================================================
+
+
+def test_the_two_papers_loci_are_registered_with_their_documented_boxes():
+    lericolais = b._LOCI["nw_outer_shelf_lericolais_dune_terrace"]
+    assert lericolais.lon_deg == (29.5, 31.0)
+    assert lericolais.lat_deg == (43.5, 44.5)
+    assert lericolais.modern_depth_m == (-115.0, -90.0)
+
+    giosan = b._LOCI["danube_delta_separation_surface"]
+    assert giosan.lon_deg == (28.8, 30.0)
+    assert giosan.lat_deg == (44.6, 45.4)
+    assert giosan.modern_depth_m == (-45.0, 5.0)
+
+
+def test_every_registered_marker_source_prefix_points_at_a_locus_that_exists():
+    """The silent-reintroduction failure mode: a prefix aimed at a missing locus.
+
+    ``_locus_for_marker_source`` returns the NAME, and ``locus_solid_displacement``
+    only discovers that the name is unknown when a row actually reaches it - i.e.
+    at bake time, on one epoch, as a ``ValueError`` that reads nothing like "you
+    renamed a locus".  Check the whole table statically instead.
+    """
+    for prefix, locus_name in b._MARKER_SOURCE_LOCI:
+        assert locus_name in b._LOCI, (prefix, locus_name)
+    # ...and every locus name is its own key, so a lookup cannot land elsewhere.
+    for key, locus in b._LOCI.items():
+        assert locus.name == key
+
+
+def test_the_four_new_prefixes_resolve_to_the_documented_loci():
+    resolve = b._locus_for_marker_source
+    assert (
+        resolve("UNKNOWN:lericolais2009_nw_outer_shelf_-100m_dune_terrace_LOCUS_ONLY")
+        == "nw_outer_shelf_lericolais_dune_terrace"
+    )
+    assert (
+        resolve("UNKNOWN:giosan2009_danube_delta_separation_surface_LOCUS_ONLY")
+        == "danube_delta_separation_surface"
+    )
+    assert (
+        resolve("UNKNOWN:bracket_midpoint_held_flat_from_the_10.9ka_anchor(...)")
+        == "basin_shelf_band"
+    )
+    assert (
+        resolve("UNKNOWN:gradual_tail_ramp_toward_the_9.4ka_reconnection(...)")
+        == "basin_shelf_band"
+    )
+
+
+def test_each_new_locus_why_states_its_georeferencing_honestly():
+    lericolais = b._LOCI["nw_outer_shelf_lericolais_dune_terrace"].why.lower()
+    # why it is WIDER than the pseudo-3D mosaic the paper actually publishes
+    assert "mosaic" in lericolais
+    assert "graticule" in lericolais
+    giosan = b._LOCI["danube_delta_separation_surface"].why.lower()
+    assert "0.05" in giosan  # the stated georeferencing precision, in degrees
+    assert "graticule" in giosan
+
+
+def test_the_lericolais_locus_tracks_the_single_cell_under_the_mosaic():
+    """The box is widened because 1 cell < locus_solid_displacement's minimum of 5.
+
+    Widening is only defensible if it does not MOVE the answer, so measure the
+    difference against the one 10-arcmin cell the 20x5 km mosaic actually falls
+    in (30.1667 E / 43.9167 N).  Sub-0.12 m at every epoch that uses it.
+    """
+    _real_ice6g_epochs_or_skip()
+    for epoch, want in ((10.0, -0.114), (9.5, -0.110), (9.0, -0.103), (7.5, -0.080)):
+        median, _bracket, n_cells = b.locus_solid_displacement(
+            epoch, "nw_outer_shelf_lericolais_dune_terrace"
+        )
+        cell, _block = b.marker_solid_displacement(epoch, 30.1667, 43.9167)
+        assert n_cells == 7, epoch
+        assert median - cell == pytest.approx(want, abs=5e-3), epoch
+
+
+def test_the_six_frames_that_used_to_refuse_now_convert():
+    """Each with rule="locus" - never "marker": no coordinate was ever printed."""
+    _real_ice6g_epochs_or_skip()
+    df = _real_pontic_df()
+    expected = {
+        (10.0, "gradual"): ("basin_shelf_band", -68.26, (-72.31, -64.64)),
+        (10.0, "catastrophic"): ("basin_shelf_band", -68.26, (-72.31, -64.64)),
+        (9.5, "gradual"): ("basin_shelf_band", -29.02, (-32.80, -25.68)),
+        (9.5, "catastrophic"): (
+            "nw_outer_shelf_lericolais_dune_terrace",
+            -85.21,
+            (-86.03, -84.60),
+        ),
+        (9.0, "catastrophic"): (
+            "nw_outer_shelf_lericolais_dune_terrace",
+            -86.55,
+            (-87.30, -85.99),
+        ),
+        (7.5, "catastrophic"): (
+            "nw_outer_shelf_lericolais_dune_terrace",
+            -90.03,
+            (-90.59, -89.61),
+        ),
+    }
+    for (epoch, scenario), (locus, want_t, (want_lo, want_hi)) in expected.items():
+        t = b.pontic_threshold(df, epoch, scenario)
+        assert t.rule == "locus", (epoch, scenario)
+        assert t.frame == "F2", (epoch, scenario)
+        assert locus in t.provenance, (epoch, scenario)
+        assert t.threshold_m == pytest.approx(want_t, abs=0.05), (epoch, scenario)
+        lo, hi = t.bracket_m
+        assert lo == pytest.approx(want_lo, abs=0.05), (epoch, scenario)
+        assert hi == pytest.approx(want_hi, abs=0.05), (epoch, scenario)
+
+
+def test_the_two_10ka_columns_get_the_SAME_threshold():
+    """Do not "fix" this.  Their level is -80 m in BOTH columns, and -80 is
+    neither Giosan's -30 nor Lericolais's -100: it is the 10.9 ka central value
+    held flat, itself the midpoint of BLVK9814's measured -55 mbsl ceiling and the
+    -100 m lowstand, i.e. from no source.  Charging gradual to Giosan and
+    catastrophic to Lericolais would MANUFACTURE a ~3.9 m difference out of an
+    attribution that neither column's -80 m supports.
+    """
+    _real_ice6g_epochs_or_skip()
+    df = _real_pontic_df()
+    grad = b.pontic_threshold(df, 10.0, "gradual")
+    cat = b.pontic_threshold(df, 10.0, "catastrophic")
+    assert grad.level_m == cat.level_m == pytest.approx(-80.0)
+    assert grad.threshold_m == pytest.approx(cat.threshold_m, abs=1e-12)
+    assert grad.bracket_m == cat.bracket_m
+
+
+def test_nothing_is_unconvertible_any_more_so_the_plain_bake_does_not_abort():
+    _real_ice6g_epochs_or_skip()
+    _thresholds, unconvertible = b.preflight_thresholds(_real_pontic_df())
+    assert unconvertible == {}
+
+
+def test_registering_the_loci_left_the_twenty_already_baked_thresholds_untouched():
+    """Bit-for-bit: a new locus must not perturb a frame it does not govern."""
+    _real_ice6g_epochs_or_skip()
+    df = _real_pontic_df()
+    for epoch, want in (
+        (22, -104.17),
+        (18, -98.23),
+        (16.5, -18.02),
+        (14.5, -18.57),
+        (12, -46.13),
+        (11, -65.25),
+        (9, -3.74),
+        (7.5, 2.49),
+        (5, 2.33),
+        (2, 0.63),
+        (0, 0.00),
+    ):
+        t = b.pontic_threshold(df, epoch, "gradual")
+        assert t.threshold_m == pytest.approx(want, abs=0.005), epoch

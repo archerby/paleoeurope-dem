@@ -100,7 +100,25 @@ class RenderConfig:
         Ice-sheet pixels thicker than this value (m) receive the white override.
         Default 10 m.
     seam_sigma_px : float
-        Gaussian σ for tile-seam blending along tile borders.  Default 5 px.
+        Gaussian σ for tile-seam blending across the borders WHERE TWO TILES
+        ACTUALLY MEET.  Default 5 px.  ``0`` disables the blend outright; a
+        negative value is refused.  A single-file input has no seams and is never
+        blended at any σ — see :func:`build_epoch_mosaic`.
+    seam_blend_max_shift_m : float
+        How far the seam blend may move the terrain before it has to say so.
+        Default 2.0 m, which is :func:`assign_basins`' own default
+        ``sill_tolerance_m``: a smoothing step that can move a crest by more than
+        the sill guard tolerates must not do it in silence.  Exceeding it emits a
+        :class:`SeamBlendShiftWarning` carrying the measured shift and its
+        position.
+    legacy_degree_grid_blend : bool
+        **Reproduction switch, not a feature.**  ``True`` restores the pre-2026-08
+        behaviour of blurring a ±3σ strip around every WHOLE DEGREE line crossing
+        the mosaic, tiles or no tiles.  It exists for exactly one purpose: to
+        regenerate, byte-for-byte, frames that were baked before that was
+        recognised as a defect — the 20 Pontic frames under
+        ``renders/black_sea_corrected/topo/`` among them.  It is wrong physics on
+        any new render; see :func:`build_epoch_mosaic` for what it costs.
     land_elev_percentile_lo : float
         Lower colour-scale percentile for land elevation (clips deep valleys).
     land_elev_percentile_hi : float
@@ -113,6 +131,8 @@ class RenderConfig:
     vert_exag: float = 8.0
     ice_threshold_m: float = 10.0
     seam_sigma_px: float = 5.0
+    seam_blend_max_shift_m: float = 2.0
+    legacy_degree_grid_blend: bool = False
     land_elev_percentile_lo: float = 2.0
     land_elev_percentile_hi: float = 98.0
     extra_figure_title: str = ""
@@ -142,6 +162,24 @@ class RenderConfig:
 # adjacent published samples"; anything wider means the curve does not resolve
 # the epoch and :func:`get_sea_level_for_epoch` says so instead of answering.
 MAX_CURVE_NODE_GAP_YR = 1_000.0
+
+
+class SeamBlendShiftWarning(UserWarning):
+    """A tile-seam blend moved the terrain further than the caller allowed.
+
+    Smoothing is not neutral on a spillway.  A Gaussian applied across a channel
+    narrower than a few working pixels pulls the shoulders into the floor and the
+    crest goes UP, which is the direction that turns a spilling basin endorheic.
+    Measured on the real Caspian↔Pontic working raster (2026-08-01), the blend
+    that used to run across every whole-degree line moved the Manych point sill at
+    44.119 E / 45.773 N from +24.00 m to +40.76 m at ``max_px=2000``.
+
+    So the blend reports what it did.  This warning carries the largest shift it
+    caused and where, and it fires whenever that exceeds
+    ``RenderConfig.seam_blend_max_shift_m``.  It is a warning and not an exception
+    because a seam genuinely does need smoothing and 2 m is a bound, not a law —
+    but it is never silent.
+    """
 
 
 class SeaLevelCurveResolutionError(ValueError):
@@ -503,20 +541,29 @@ class SillResolutionError(ValueError):
 
     ``spilling`` is only as honest as the grid it is observed on, and a spillway
     narrower than the working pixel is filled in by resampling.  Measured on the
-    real Caspian↔Pontic raster (2026-08-01), the Manych saddle reads
+    real Caspian↔Pontic working raster, the Manych **point** sill at
+    44.119 E / 45.773 N reads
 
-    ==========================================================  =========
-    native GEBCO 15 arcsec, untouched                            +25.00 m
-    bilinear-downsampled to a 2000 px render mosaic              +30.00 m
-    ... plus the renderer's ``dem_sm`` gaussian σ = 1.5 px       +33.35 m
-    ... plus ``build_epoch_mosaic``'s tile-seam blend at 44 E    +38.52 m
-    ==========================================================  =========
+    =========================================================  ========  ========
+    reading, at ``max_px``                                          2000      4000
+    =========================================================  ========  ========
+    native GEBCO 15 arcsec, untouched                           +23.00 m  +23.00 m
+    bilinear-downsampled to the render mosaic                    +24.00 m  +25.00 m
+    ... plus the seam blend as it stood on 2026-08-01            +40.76 m  +30.57 m
+    =========================================================  ========  ========
 
-    — 13.5 m of purely numerical rise, which at a +35 m Khvalynian highstand
-    turns a SPILLING frame into an endorheic one without a word.  A caller who
-    has measured the sill at native resolution passes it as
+    The last row is **gone as of 2026-08-01**: that blend ran along every whole
+    degree line whether or not a tile boundary was there, and a single-file input —
+    which is what both bakes pass — has no seams at all.  See
+    :func:`build_epoch_mosaic`.  What remains is the honest cost of downsampling,
+    +1.00 m and +2.00 m respectively, inside the 2 m default tolerance below.
+
+    The 16.76 m that used to sit on top of it was not: at a +35 m Khvalynian
+    highstand it turns a SPILLING frame into an endorheic one without a word.  A
+    caller who has measured the sill at native resolution passes it as
     ``sill_expectations`` and gets this exception instead of a quietly wrong
-    animation.
+    animation — which is the guard that stays whether or not any one smoothing step
+    is currently behaving.
     """
 
 
@@ -825,12 +872,27 @@ def assign_basins(
 
     How the spill is decided
     ------------------------
-    Also from the terrain: two basins are connected iff the fill of the higher one
-    **at its own level** reaches the other one's seed (``scipy.ndimage.label`` on
-    ``dem < max(level_i, level_j)``).  That is the "the two fills merged" test, and
-    it is the animation's whole subject, so it is a first-class output
-    (:attr:`BasinField.spilling`, :attr:`BasinField.connected_groups`) rather than
-    an assertion carried in from a level curve.
+    Also from the terrain.  Basin **A spills into B iff there is a path from A's
+    seed to B's seed on which every cell lies below A's own water surface, and B is
+    the first basin that path reaches.**  Two halves, both load-bearing:
+
+    * **A donor-level flood, not a pairwise max.**  The test is
+      ``dem < level_A``, never ``dem < max(level_A, level_B)``.  The pairwise max
+      floods every basin lying between the two to the donor's level as well, which
+      invents connections: a Caspian at +35 m "reaches" the Mediterranean straight
+      through a Pontic basin 65 m lower, whatever the Bosphorus sill does.
+    * **First basin reached.**  Water crossing into a third basin's territory joins
+      that basin's water body at *that* basin's level.  Whether it goes further is
+      the third basin's own donor test, so a qualifying path may cross only the
+      donor's territory, the receiver's, and ground no basin drains.  Transitive
+      reach is rebuilt afterwards by union-find — A→C and C→D put A, C and D in one
+      :attr:`~BasinField.connected_groups` entry without ever asserting A→D.
+
+    The verdict is a property of the terrain and the levels, not of the order
+    *seeds* is given in.  It is the animation's whole subject, so it is a
+    first-class output (:attr:`BasinField.spilling`,
+    :attr:`BasinField.connected_groups`) rather than an assertion carried in from a
+    level curve.
 
     The corridor between two levels
     -------------------------------
@@ -984,9 +1046,30 @@ def assign_basins(
             )
 
     # ── Spill, observed ──────────────────────────────────────────────────────
-    # Two basins are connected iff filling the HIGHER one to its own level reaches
-    # the other one's seed.  The lower basin's own fill can never cross the sill,
-    # so this single directed test is the whole of the symmetric question.
+    # Basin A spills into basin B iff there is a path from A's seed to B's seed on
+    # which EVERY cell lies below A's OWN water surface — a flood at the DONOR's
+    # level — and B is the FIRST basin that path reaches.
+    #
+    # This replaces a pairwise ``dem < max(level_i, level_j)`` test that
+    # manufactured connections the terrain does not have.  Flooding to the pairwise
+    # max floods every basin in BETWEEN to the donor's level as well, so a Caspian
+    # at +35 m "reached" the Mediterranean straight through a Pontic basin standing
+    # 65 m lower — regardless of what the Bosphorus sill does, because the Pontic
+    # had been filled to +35 m by fiat.  The three-basin hero frame is exactly that
+    # configuration: it reported two spilling pairs and ``corridor="ramp"`` refused
+    # to draw it.
+    #
+    # Water that crosses into a third basin's territory joins THAT basin's water
+    # body, standing at THAT basin's level; whether it travels any further is the
+    # third basin's own donor test, asked separately in this same loop.  So a path
+    # may cross only the donor's territory, the receiver's, and ground no basin
+    # drains (the corridor crest itself).  Transitive reach is then rebuilt by the
+    # union-find below, which is where it belongs: A→C and C→D put A, C and D in one
+    # group without ever claiming A→D on C's behalf.
+    #
+    # The result cannot depend on the order *seeds* was given in: every ordered pair
+    # is asked, and the answer for (i, j) is a property of the terrain, the two
+    # levels and the third-party territories — none of which is an ordering.
     component_cache: dict[float, np.ndarray] = {}
 
     def components(level: float) -> np.ndarray:
@@ -996,13 +1079,32 @@ def assign_basins(
             component_cache[level] = cached
         return cached
 
-    merged_pairs: list[tuple[int, int]] = []
+    def donor_reach(i: int) -> np.ndarray:
+        """Everything a flood at basin *i*'s own level wets, starting from its seed."""
+        labelled = components(levels[i])
+        # The seed is under its own water (validated above), so its label is > 0.
+        return labelled == labelled[seed_rc[i]]
+
+    spills: list[tuple[int, int]] = []           # directed (donor, receiver)
     for i in range(len(seeds)):
-        for j in range(i + 1, len(seeds)):
-            labelled = components(max(levels[i], levels[j]))
-            a = labelled[seed_rc[i]]
-            if a != 0 and a == labelled[seed_rc[j]]:
-                merged_pairs.append((i, j))
+        reach = donor_reach(i)
+        for j in range(len(seeds)):
+            if i == j or not reach[seed_rc[j]]:
+                continue
+            third_party = np.zeros(dem.shape, dtype=bool)
+            for k in range(len(seeds)):
+                if k != i and k != j:
+                    third_party |= basin_id == k + 1
+            if third_party.any():
+                direct, _ = ndi_label(reach & ~third_party)
+                home = direct[seed_rc[i]]
+                if home == 0 or direct[seed_rc[j]] != home:
+                    continue                     # only reachable THROUGH a third basin
+            spills.append((i, j))
+
+    merged_pairs: list[tuple[int, int]] = sorted(
+        {(min(i, j), max(i, j)) for i, j in spills}
+    )
 
     parent = list(range(len(seeds)))
 
@@ -1045,6 +1147,16 @@ def assign_basins(
             receiver_labels = components(levels[receiver])
             receiver_water = receiver_labels == receiver_labels[seed_rc[receiver]]
             candidates = extent & ~donor_water & ~receiver_water
+            # A basin that is neither donor nor receiver keeps its OWN flat surface.
+            # ``extent`` is a flood at the DONOR's level and reaches straight across
+            # a third basin's territory; interpolating a corridor level there would
+            # repaint that basin with a number belonging to two other seas — in the
+            # hero frame, lifting a Mediterranean at −45 m onto the Caspian→Pontic
+            # ramp.  Whether the third basin is itself connected is its own donor
+            # test, already asked above.
+            for other in range(len(seeds)):
+                if other != donor and other != receiver:
+                    candidates &= basin_id != other + 1
 
             if candidates.any():
                 if corridor == "step":
@@ -1088,14 +1200,99 @@ def assign_basins(
     )
 
 
+def interior_tile_seams(
+    tile_bounds: Sequence[BoundingBox],
+    mosaic_bounds: BoundingBox,
+    tolerance: float,
+) -> tuple[list[float], list[float]]:
+    """Where the tiles of a mosaic actually meet: (seam longitudes, seam latitudes).
+
+    A seam is an edge shared by two tiles, i.e. a tile edge that falls in the
+    *interior* of the merged extent.  A tile edge coinciding with the outside of
+    the mosaic is not a seam — there is nothing on the far side of it to blend to.
+    A one-file mosaic therefore has no seams at all, whatever its extent.
+
+    This replaces "every whole degree line crossing the mosaic", which was a proxy
+    for the tile grid that is wrong in both directions: it blurs interior terrain
+    when the tiles are bigger than a degree (or when there is only one), and it
+    misses a genuine seam that does not land on a whole degree.
+
+    *tolerance* is the distance (in CRS units) within which an edge counts as
+    lying ON the mosaic boundary rather than inside it; pass one output pixel.
+    """
+    lons: set[float] = set()
+    lats: set[float] = set()
+    for b in tile_bounds:
+        for x in (float(b.left), float(b.right)):
+            if mosaic_bounds.left + tolerance < x < mosaic_bounds.right - tolerance:
+                lons.add(round(x, 9))
+        for y in (float(b.bottom), float(b.top)):
+            if mosaic_bounds.bottom + tolerance < y < mosaic_bounds.top - tolerance:
+                lats.add(round(y, 9))
+    return sorted(lons), sorted(lats)
+
+
+def seam_blend_shift_m(
+    raw: np.ndarray,
+    blended: np.ndarray,
+    transform: rasterio.transform.Affine,
+) -> tuple[float, tuple[float, float]]:
+    """Largest elevation the blend moved, and where — ``(metres, (lon, lat))``.
+
+    A smoothing step is not neutral on a spillway: a Gaussian applied across a
+    channel only a few working pixels wide pulls the shoulders into the floor and
+    the crest goes UP, which is the direction that turns a spilling basin
+    endorheic.  So the blend is measured against the surface it was handed, and
+    the number is available rather than inferred later from a wrong picture.
+    """
+    both = np.isfinite(raw) & np.isfinite(blended)
+    shift = np.where(both, np.abs(blended - raw), 0.0)
+    if not shift.size:
+        return 0.0, (float("nan"), float("nan"))
+    row, col = np.unravel_index(int(np.argmax(shift)), shift.shape)
+    lon, lat = transform * (int(col) + 0.5, int(row) + 0.5)
+    return float(shift[row, col]), (float(lon), float(lat))
+
+
 def build_epoch_mosaic(
     tile_paths: dict[str, str | Path],
     config: Optional[RenderConfig] = None,
 ) -> tuple[np.ndarray, np.ndarray, rasterio.transform.Affine, BoundingBox, object, float]:
     """Merge per-tile GeoTIFFs into a single down-sampled mosaic array.
 
-    Tile boundary seams are smoothed with a 1-D Gaussian filter applied in
-    strips along each integer degree boundary.
+    Seams — and only seams
+    ----------------------
+    Where two tiles meet, the merge leaves a step, and a 1-D Gaussian across the
+    shared edge hides it.  The seams are taken from the **tiles' own bounds**
+    (:func:`interior_tile_seams`).  Two consequences that were not true before:
+
+    * a **single-file input is never blended**, at any σ.  It has no seams, so
+      there is nothing to hide, and blurring it is pure interior damage.  Both
+      bakes in this repo pass exactly one file.
+    * a genuine seam that does not land on a whole degree is still blended.
+
+    What that was costing.  Until 2026-08 the strips ran along every whole degree
+    line crossing the mosaic, tiles or no tiles.  Measured on the real
+    Caspian↔Pontic working raster (a single 15-arcsec file, 25.5–58 E / 36–54 N):
+
+    ==========================  ==========  ==========  =====================
+    setting                     Manych raw  → blended   cells moved >1 cm
+    ==========================  ==========  ==========  =====================
+    ``max_px=2000``               +24.00 m    +40.76 m  75 % of the mosaic
+    ``max_px=4000``               +25.00 m    +30.57 m  44 % of the mosaic
+    ==========================  ==========  ==========  =====================
+
+    A +16.76 m rise at the Manych point sill turns a Caspian spilling over
+    +23.00 m at a +35 m highstand into an endorheic lake, silently, in the
+    direction that deletes the subject of the animation.
+
+    Never silently
+    --------------
+    Whatever blending does happen is measured against the unblended merge
+    (:func:`seam_blend_shift_m`) and reported as a :class:`SeamBlendShiftWarning`
+    as soon as it exceeds ``config.seam_blend_max_shift_m`` (default 2.0 m — the
+    same tolerance :func:`assign_basins` applies to a sill).  A smoothing step that
+    can move a crest must say by how much and where.
 
     Parameters
     ----------
@@ -1104,7 +1301,9 @@ def build_epoch_mosaic(
         files are discovered automatically as ``<tile>_ice.tif``.
     config : RenderConfig | None
         Render configuration.  Defaults to :class:`RenderConfig` with all
-        defaults if ``None``.
+        defaults if ``None``.  ``seam_sigma_px=0`` disables the blend outright;
+        ``legacy_degree_grid_blend=True`` restores the whole-degree behaviour
+        described above, for reproducing frames baked before it was fixed.
 
     Returns
     -------
@@ -1125,8 +1324,21 @@ def build_epoch_mosaic(
     ------
     FileNotFoundError
         If no valid tile files are found.
+    ValueError
+        If ``config.seam_sigma_px`` is negative.
+
+    Warns
+    -----
+    SeamBlendShiftWarning
+        The blend moved the terrain further than ``config.seam_blend_max_shift_m``.
     """
     cfg = config or RenderConfig()
+    sig = float(cfg.seam_sigma_px)
+    if sig < 0.0:
+        raise ValueError(
+            f"seam_sigma_px={sig!r} is negative. A Gaussian σ is a width, not a "
+            "direction; pass 0 to switch the seam blend off."
+        )
 
     valid = [Path(f) for f in tile_paths.values() if Path(f).exists()]
     if not valid:
@@ -1135,6 +1347,7 @@ def build_epoch_mosaic(
     dem_ds = [rasterio.open(f) for f in valid]
     try:
         crs = dem_ds[0].crs
+        tile_bounds = [d.bounds for d in dem_ds]
         west = min(d.bounds.left for d in dem_ds)
         east = max(d.bounds.right for d in dem_ds)
         south = min(d.bounds.bottom for d in dem_ds)
@@ -1177,27 +1390,59 @@ def build_epoch_mosaic(
         ice = np.zeros((H, W), dtype=np.float32)
 
     # ── Tile-seam Gaussian blending ─────────────────────────────────────────
-    sig = cfg.seam_sigma_px
-    hw = int(np.ceil(sig * 3))
-    dem_s = mosaic.copy()
-    nd = np.isnan(dem_s)
-    dem_s[nd] = 0.0
+    # Only across edges two tiles actually share.  ``legacy_degree_grid_blend``
+    # restores the whole-degree grid this replaced — see the docstring for the
+    # +16.76 m it moved the Manych sill by, and use it only to reproduce a frame
+    # baked before the fix.
+    if cfg.legacy_degree_grid_blend:
+        seam_lons = [float(v) for v in range(int(np.ceil(west)), int(east) + 1)]
+        seam_lats = [float(v) for v in range(int(np.ceil(south)), int(north) + 1)]
+    else:
+        seam_lons, seam_lats = interior_tile_seams(tile_bounds, bounds, tgt_res)
 
-    for lat in range(int(np.ceil(south)), int(north) + 1):
-        r = int(round((north - lat) / tgt_res))
-        r0, r1 = max(0, r - hw), min(H, r + hw + 1)
-        if r0 < r1:
-            dem_s[r0:r1, :] = gaussian_filter1d(dem_s[r0:r1, :], sigma=sig, axis=0)
+    if sig > 0.0 and (seam_lons or seam_lats):
+        hw = int(np.ceil(sig * 3))
+        dem_s = mosaic.copy()
+        nd = np.isnan(dem_s)
+        dem_s[nd] = 0.0
 
-    for lon in range(int(np.ceil(west)), int(east) + 1):
-        c = int(round((lon - west) / tgt_res))
-        c0, c1 = max(0, c - hw), min(W, c + hw + 1)
-        if c0 < c1:
-            dem_s[:, c0:c1] = gaussian_filter1d(dem_s[:, c0:c1], sigma=sig, axis=1)
+        for lat in seam_lats:
+            r = int(round((north - lat) / tgt_res))
+            r0, r1 = max(0, r - hw), min(H, r + hw + 1)
+            if r0 < r1:
+                dem_s[r0:r1, :] = gaussian_filter1d(dem_s[r0:r1, :], sigma=sig, axis=0)
 
-    mosaic = np.where(nd, np.nan, dem_s)
-    del dem_s
-    gc.collect()
+        for lon in seam_lons:
+            c = int(round((lon - west) / tgt_res))
+            c0, c1 = max(0, c - hw), min(W, c + hw + 1)
+            if c0 < c1:
+                dem_s[:, c0:c1] = gaussian_filter1d(dem_s[:, c0:c1], sigma=sig, axis=1)
+
+        blended = np.where(nd, np.nan, dem_s)
+
+        # Measured, then said out loud.  A blend that can move a sill must never
+        # do it in silence — the alternative is discovering it in a frame that
+        # reports a spilling basin as endorheic.
+        shift, (shift_lon, shift_lat) = seam_blend_shift_m(mosaic, blended, xform)
+        if shift > cfg.seam_blend_max_shift_m:
+            warnings.warn(
+                f"tile-seam blend (σ={sig:g} px, "
+                f"{len(seam_lons)} lon / {len(seam_lats)} lat seam"
+                f"{'' if len(seam_lons) + len(seam_lats) == 1 else 's'}) moved the "
+                f"terrain by up to {shift:.2f} m at "
+                f"{shift_lon:.4f} E / {shift_lat:.4f} N, more than the "
+                f"{cfg.seam_blend_max_shift_m:.2f} m allowed by "
+                "seam_blend_max_shift_m. Smoothing across a channel narrower than a "
+                "few working pixels RAISES its crest, which is the direction that "
+                "turns a spilling basin endorheic. Check any sill within "
+                f"{hw} px of a seam before trusting this frame's spill verdict.",
+                SeamBlendShiftWarning,
+                stacklevel=2,
+            )
+
+        mosaic = blended
+        del dem_s
+        gc.collect()
 
     return mosaic, ice, xform, bounds, crs, tgt_res
 
@@ -1291,10 +1536,11 @@ def render_paleocostline_epoch(
         Passed through to :func:`assign_basins`.
     basin_sill_expectations, basin_sill_tolerance_m
         Passed through to :func:`assign_basins`.  **Use them for any frame whose
-        subject is a spillway**: the mosaic this function builds is down-sampled,
-        seam-blended and gaussian-smoothed, and a channel narrower than the
-        resulting pixel is filled in — measured at +13.5 m of spurious sill rise
-        across the Manych.  See :class:`SillResolutionError`.
+        subject is a spillway**: the mosaic this function builds is down-sampled and
+        gaussian-smoothed, and a channel narrower than the resulting pixel is filled
+        in.  See :class:`SillResolutionError` for the current budget, and
+        :func:`build_epoch_mosaic` for the seam blend that used to add another
+        +16.76 m to it at ``max_px=2000``.
 
     Returns
     -------
