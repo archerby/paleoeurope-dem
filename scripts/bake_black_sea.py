@@ -46,6 +46,58 @@ whatever local sea-surface residual is baked into ``Δz_engine`` cancels against
 the same scalar.  The deliberately-WRONG comparison frames are the one place a
 eustatic curve survives, and that is the whole point of them — see ``main()``.
 
+TWO GUARDS ON READING THE CURVE (added 2026-08-03)
+--------------------------------------------------
+Both were latent substitutions, both are now refusals, and neither changes a number
+this bake has ever produced — all 13 shipped epochs land on exact curve rows and on
+exact ICE-6G epochs.
+
+1. **The nearest-age lookup is bounded.**  :func:`basin_level` used to take whatever
+   row minimised ``|age_ka - epoch|``, however far away.  At 16.75 ka the 17.0 and
+   16.5 ka rows are equidistant and read -58.3 m and -30.0 m, so the threshold was
+   28.3 m of DataFrame row order — and the two rows do not even carry the same kind
+   of provenance.  Past :data:`_CURVE_AGE_TOL_KA` it now raises
+   :class:`CurveAgeGapError`.
+2. **Off-grid epochs no longer hit a raw ``FileNotFoundError``.**  ICE-6G ships
+   0.5 ka steps to 21 ka, so 14.7 and 7.15 ka — rows this curve genuinely carries —
+   used to die inside :func:`_open_bs_window`.  They are now blended linearly in
+   time between the two bracketing ICE-6G epochs by :func:`_ice6g_bracket` (moved
+   here from ``bake_khvalynian``, one implementation for both bakes) and the result
+   is TAGGED ``ice6g_interpolated=True``.  An untagged interpolation is a
+   substituted number.  Cross-check: 14.7 ka resolves to **-17.278 m**, which is the
+   contract §5a-bis per-row value -17.28 m measured independently.
+
+``unc_low`` / ``unc_high`` IS ONE PAIR PER ROW — NOT A PER-SCENARIO BAND
+------------------------------------------------------------------------
+Both curves carry ``unc_low`` / ``unc_high`` beside their level columns.  **They are
+carried ONCE PER ROW and are read identically whichever scenario column is asked
+for.**  Calling the result "the band around the *maximal* scenario" is a claim the
+data does not make, and on the Caspian curve it is measurably false: at 16.0 ka the
+pair is [+22.0, +50.0] while ``defensible`` reads +35.0 and ``maximal`` +48.0 — one
+pair bracketing BOTH schools, i.e. an inter-school **scenario envelope**, not a
+per-scenario uncertainty.  Measured on all 71 Caspian rows x all six level columns:
+no level falls outside the pair, and 63 distinct pairs serve 71 rows.
+
+So the object is named :class:`LevelEnvelope`, read by :func:`basin_level_envelope`,
+and every result carries a measured ``scope`` naming which level columns the pair
+actually brackets AT THAT ROW.  That scope is a measurement and not a constant: on
+the **Pontic** curve the same pair fails to contain ``catastrophic`` at 9.0 / 8.5 /
+8.0 / 7.5 ka, so there it is not an envelope over both columns and the field says so.
+
+The edges are read off the SAME row as the level, converted with the SAME
+``conversion_m`` and the same rule as the central (contract §8, edge for edge), and
+:class:`MissingEnvelopeError` refuses one that is absent, NaN, inverted, DEGENERATE
+(zero width — a "band" asserting certainty), or does not contain the central it was
+checked against.  Nothing substitutes the central, nothing borrows the neighbouring
+row (widths run 75 m to 5 m on this curve), and a synthesized low-scenario COLUMN is
+forbidden outright.
+
+Here the envelope is carried beside the threshold and nothing is thresholded on it, so
+this module CATCHES the refusal and records it in ``envelope_status``.  The Khvalynian
+bake does not catch, because there the envelope drives a spill verdict.  It fires on
+the shipped data: the catastrophic column reads -100 m at 9.0 / 8.5 / 8.0 / 7.5 ka
+against a pair written for the gradual column, and 9.0 and 7.5 ka are baked epochs.
+
 PALEO-DEM
 ---------
 paleo_dem(t) = H_modern + Δz_solid(t)   (present-datum solid-earth displacement)
@@ -132,8 +184,9 @@ import logging
 import os
 import sys
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 
 # Make the package importable when run directly (repo is not pip-installed).
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -289,6 +342,25 @@ _PRESENT_DAY_ANCHOR_M: dict[str, tuple[float, float]] = {
 
 # How close a curve row must sit to 0 ka to count as the present-day anchor.
 _ANCHOR_AGE_TOL_KA = 0.25
+
+# How close a curve row must sit to a REQUESTED EPOCH before its level may be read
+# as that epoch's level (ka).  This is the guard on the nearest-age lookup, and it
+# is deliberately tight enough that "nearest" means "the row for this epoch":
+#
+#   * both shipped curves write ``age_ka`` to two decimals, i.e. 0.01 ka is their
+#     own age resolution, so this tolerance absorbs the representation and nothing
+#     else;
+#   * the tightest ADJACENT row spacing is 0.05 ka in the Caspian curve and 0.10 ka
+#     in the Pontic one, so 0.01 ka can never reach a second row and the lookup
+#     cannot be ambiguous by a hair.
+#
+# WHAT IT COSTS AND WHY THAT IS THE POINT: 16.75 ka is 0.25 ka from BOTH the 17.0
+# and the 16.5 ka Pontic rows, whose levels are -58.3 m and -30.0 m.  Without a
+# tolerance ``idxmin`` silently returns the first of the two in DataFrame order —
+# 28.3 m of threshold decided by row order — and the two rows do not even carry the
+# same provenance (a seismic-wedge lowstand locus vs the Bosphorus sill marker), so
+# there is no defensible way to pick one.  With the tolerance that epoch RAISES.
+_CURVE_AGE_TOL_KA = 0.01
 
 # The Manych spillway sill that the Khvalynian Caspian had to overtop to drain
 # west into the Pontic basin (m vs present global SL).
@@ -550,6 +622,105 @@ def _epoch_filename(epoch: float) -> str:
     return f"I6_C.VM5a_10min.{epoch}.nc"
 
 
+# ---------------------------------------------------------------------------
+# The shipped ICE-6G age grid, and linear-in-time interpolation between it
+# ---------------------------------------------------------------------------
+#
+# MOVED HERE 2026-08-03 from ``bake_khvalynian``, which is where it was written and
+# where it is still re-exported from.  It moved because ``pontic_threshold`` needs
+# the same mechanism and this module cannot import that one (it is the other way
+# round), and because two copies of a time-interpolation rule is two rules that can
+# disagree about what "linear in time" means.  The behaviour is unchanged: an epoch
+# that IS a shipped ICE-6G age returns ``(age, age, 0.0)`` and no interpolation code
+# runs, so every on-grid number in either bake is bit-identical to before.
+
+
+@lru_cache(maxsize=8)
+def _ice6g_ages_in(directory: Path) -> tuple[float, ...]:
+    """Ages (ka) with an ICE-6G file in *directory*, ascending.  Cached per DIR.
+
+    Keyed on the directory rather than cached once, because :data:`ICE6G_DIR` is a
+    module attribute that tests (and a future compute box) legitimately repoint: a
+    single-slot cache would answer a question about one distribution with the
+    contents of another, which is the same class of error as reading a level off the
+    wrong row.
+    """
+    ages: list[float] = []
+    for path in Path(directory).glob("I6_C.VM5a_10min.*.nc"):
+        token = path.name[len("I6_C.VM5a_10min.") : -len(".nc")]
+        try:
+            ages.append(float(token))
+        except ValueError:  # pragma: no cover - a stray file, not an age
+            continue
+    if not ages:
+        raise FileNotFoundError(f"no ICE-6G files under {directory}")
+    return tuple(sorted(ages))
+
+
+def ice6g_ages_ka() -> tuple[float, ...]:
+    """Ages (ka) for which an ICE-6G file exists, ascending.
+
+    Read from the directory, never assumed: the distribution steps 0.5 ka to 21 ka
+    and 1 ka beyond, and hard-coding that would silently mis-bracket if a file were
+    added or missing.
+    """
+    return _ice6g_ages_in(ICE6G_DIR)
+
+
+def _ice6g_bracket(epoch: float) -> tuple[float, float, float]:
+    """``(lo, hi, w)`` such that ``f(epoch) = (1-w)*f(lo) + w*f(hi)``.
+
+    ``lo == hi`` and ``w == 0.0`` when *epoch* is itself a shipped ICE-6G age, so an
+    on-grid epoch is computed EXACTLY and no interpolation code runs.  Off-grid, the
+    blend is linear in time between the two exactly-computed neighbours.
+
+    Raises
+    ------
+    ValueError
+        Outside the shipped range.  Extrapolating a GIA field past the end of the
+        model is not a small error; it is an invented epoch.
+    """
+    ages = np.asarray(ice6g_ages_ka(), dtype=float)
+    want = float(epoch)
+    exact = np.isclose(ages, want, rtol=0.0, atol=1e-9)
+    if exact.any():
+        age = float(ages[exact][0])
+        return age, age, 0.0
+    if want < ages[0] or want > ages[-1]:
+        raise ValueError(
+            f"{want:g} ka is outside the shipped ICE-6G range "
+            f"[{ages[0]:g}, {ages[-1]:g}] ka — the GIA field would have to be "
+            "extrapolated, which invents an epoch rather than approximating one"
+        )
+    hi_i = int(np.searchsorted(ages, want))
+    lo, hi = float(ages[hi_i - 1]), float(ages[hi_i])
+    return lo, hi, (want - lo) / (hi - lo)
+
+
+def ice6g_is_interpolated(epoch: float) -> bool:
+    """Is this epoch's GIA field a blend of two shipped ICE-6G epochs?
+
+    ``True`` is not a small caveat, which is why it is carried as its own field on
+    :class:`BasinThreshold` rather than left implicit in a note: an UNTAGGED
+    interpolation is indistinguishable downstream from a number the model actually
+    produced.  ICE-6G ships 0.5 ka steps to 21 ka, so every quarter-ka epoch of the
+    Khvalynian window — and 14.7 and 7.15 ka on the Pontic curve — is one of these.
+    """
+    lo, hi, _w = _ice6g_bracket(epoch)
+    return lo != hi
+
+
+def _ice6g_time_note(epoch: float) -> str:
+    """Human/tag-readable statement of how *epoch* got its GIA field."""
+    lo, hi, w = _ice6g_bracket(epoch)
+    if lo == hi:
+        return f"exact ICE-6G epoch {lo:g} ka (no time interpolation)"
+    return (
+        f"linear in time between ICE-6G {lo:g} and {hi:g} ka, w={w:.4f} "
+        "(each endpoint computed exactly; the blend is the only approximation)"
+    )
+
+
 def _check_datum_sanity(level: float, basin: str, where: str) -> float:
     """Reject *level* if it is outside ``_DATUM_SANITY_RANGE_M[basin]``.
 
@@ -756,18 +927,121 @@ def validate_basin_curve(
         _check_datum_sanity(float(level), basin, f"{float(age):g} ka")
 
 
+class CurveAgeGapError(ValueError):
+    """The curve carries no row at this epoch, and a neighbour's will not be taken.
+
+    The nearest-age lookup used to be unconditional: whatever row minimised
+    ``|age_ka - epoch|`` supplied the level, however far away it was and however
+    the tie was broken.  On the shipped Pontic curve that is worth **28.3 m** at
+    16.75 ka (the 17.0 ka row's -58.3 m and the 16.5 ka row's -30.0 m are
+    equidistant, so ``idxmin`` returns whichever comes first in the DataFrame), and
+    those two rows are not even the same KIND of number — one is a seismic-wedge
+    lowstand compiled from five studies, the other is the modern Bosphorus sill
+    depth used as an overflow proxy.  Blending or picking between them is inventing
+    a level, so this raises instead.
+
+    It is a refusal, not a failure: an epoch the curve does not cover has no level,
+    and the honest frame for it is a refused frame (an animation keeps its slot and
+    hatches it) rather than a plausible-looking neighbouring number.
+    """
+
+
+def _curve_row_index(
+    df: pd.DataFrame, epoch: float, *, age_tol_ka: float = _CURVE_AGE_TOL_KA
+) -> Any:
+    """Index of THE curve row for *epoch*, or raise :class:`CurveAgeGapError`.
+
+    One lookup for the level, the envelope and the marker, so those three can never
+    be read off different rows of the same curve.
+
+    Raises
+    ------
+    CurveAgeGapError
+        The nearest row is further than *age_tol_ka* away, or two rows are equally
+        near and disagree on ANY of the three (a duplicated age).  Both messages name
+        the candidate rows and the spread between their values, because that spread
+        is the size of the error the old lookup was making silently.
+    """
+    ages = pd.to_numeric(df["age_ka"], errors="coerce").astype(float)
+    want = float(epoch)
+    gaps = (ages - want).abs()
+    if not bool(gaps.notna().any()):
+        raise CurveAgeGapError(
+            f"the curve has no usable age_ka values at all, so {want:g} ka cannot "
+            "be located in it"
+        )
+    best = float(gaps.min())
+    near = list(gaps.index[gaps <= float(age_tol_ka)])
+    if not near:
+        idx_near = gaps.idxmin()
+        raise CurveAgeGapError(
+            f"the curve has no row at {want:g} ka: the nearest is "
+            f"{float(ages.loc[idx_near]):g} ka, {best:.3f} ka away, over the "
+            f"{float(age_tol_ka):g} ka tolerance.  A neighbouring row's level is NOT "
+            "substituted — on this curve the two rows bracketing a quarter-ka epoch "
+            "can differ by tens of metres and carry different provenance, so "
+            "'nearest' would be a number decided by DataFrame row order.  Ask for "
+            "an epoch the curve carries, or widen age_tol_ka at the call site and "
+            "write down why."
+        )
+    if len(near) > 1:
+        # EVERYTHING THIS INDEX IS USED TO READ, or the scan certifies nothing.
+        # Levels and envelope edges both drive a verdict, so a duplicate that agrees
+        # on the central line and differs on its envelope is still ambiguous — and
+        # so is one that agrees on both and differs on WHICH MARKER APPLIES, which
+        # until now passed and left the choice to DataFrame row order.  A marker
+        # decides ``conversion_m``, i.e. the whole F2 -> F1 term; substituting the
+        # wrong one is the systematically one-signed error (up to 5.8 m, contract
+        # §5a-bis) that :class:`UnconvertibleThresholdError` exists to refuse.
+        # Marker columns are compared as STRINGS: two of the three are coordinates
+        # and one is a source token, and a coordinate that differs in the last
+        # decimal is a different marker.
+        numeric = [
+            col
+            for col in df.columns
+            if str(col).startswith("level_m_global_") or col in ENVELOPE_COLUMNS
+        ]
+        values: dict[str, list] = {
+            col: sorted(
+                {float(v) for v in pd.to_numeric(df.loc[near, col], errors="coerce")}
+            )
+            for col in numeric
+        }
+        for col in _MARKER_COLUMNS:
+            if col in df.columns:
+                values[col] = sorted({str(v) for v in df.loc[near, col]})
+        disagree = {c: v for c, v in values.items() if len(v) > 1}
+        if disagree:
+            raise CurveAgeGapError(
+                f"{len(near)} curve rows sit within {float(age_tol_ka):g} ka of "
+                f"{want:g} ka and they disagree: {disagree}.  Which one applies "
+                "would be decided by DataFrame row order, which is not a "
+                "measurement — de-duplicate the curve."
+            )
+    return gaps.idxmin()
+
+
 def basin_level(
     df: pd.DataFrame,
     epoch: float,
     scenario: str = "gradual",
     basin: str = "pontic",
+    *,
+    age_tol_ka: float = _CURVE_AGE_TOL_KA,
 ) -> float:
-    """Nearest-age closed-basin level (m vs present global SL) for *epoch*.
+    """Closed-basin level (m vs present global SL) at *epoch*, from ITS OWN row.
 
     *scenario* selects the reconnection column (``gradual`` or ``catastrophic``).
     *basin* selects the datum-sanity window applied to the returned scalar.  That
     window is a blow-up guard only — the sign of the curve is validated once, at
     load time, by :func:`validate_basin_curve`.
+
+    The lookup is still nearest-age, but it is now BOUNDED by *age_tol_ka*
+    (:data:`_CURVE_AGE_TOL_KA`, 0.01 ka by default) and raises
+    :class:`CurveAgeGapError` past it.  It used to be unbounded, which meant an
+    off-grid epoch quietly received a neighbouring row's number; see that class for
+    the 28.3 m this costs at 16.75 ka.  Every epoch either bake actually bakes lands
+    on an exact row, so no shipped value changes.
     """
     col = f"level_m_global_{scenario}"
     if col not in df.columns:
@@ -778,18 +1052,366 @@ def basin_level(
         raise ValueError(
             f"unknown basin {basin!r}; known basins={sorted(_DATUM_SANITY_RANGE_M)}"
         )
-    idx = (df["age_ka"] - float(epoch)).abs().idxmin()
+    idx = _curve_row_index(df, epoch, age_tol_ka=age_tol_ka)
     level = float(df.loc[idx, col])
     return _check_datum_sanity(level, basin, f"{float(epoch):g} ka")
 
 
-def pontic_level(df: pd.DataFrame, epoch: float, scenario: str = "gradual") -> float:
+def pontic_level(
+    df: pd.DataFrame,
+    epoch: float,
+    scenario: str = "gradual",
+    *,
+    age_tol_ka: float = _CURVE_AGE_TOL_KA,
+) -> float:
     """Nearest-age **Pontic** basin level (m vs present global SL) for *epoch*.
 
     Thin wrapper over :func:`basin_level` pinned to the ``pontic`` range, kept for
-    the Black-Sea callers.  Same values and same nearest-age selection as before.
+    the Black-Sea callers.  Same values and same row selection as before for every
+    epoch the curve carries; an epoch it does not carry now raises instead of
+    borrowing a neighbour (:class:`CurveAgeGapError`).
     """
-    return basin_level(df, epoch, scenario, basin="pontic")
+    return basin_level(df, epoch, scenario, basin="pontic", age_tol_ka=age_tol_ka)
+
+
+# ---------------------------------------------------------------------------
+# The curve's per-row level ENVELOPE — read, never widened, never invented
+# ---------------------------------------------------------------------------
+
+#: The two columns both shipped curves carry beside their level columns.  They are
+#: ABSOLUTE levels in the same frame and the same units as the central column, not a
+#: half-width: ``unc_low <= level <= unc_high`` holds on all 71 Caspian rows for all
+#: six level columns (pinned by ``test_unc_band_is_absolute_not_a_width``).
+#:
+#: THEY ARE CARRIED ONCE PER **ROW**, NOT PER SCENARIO.  There is one pair in the
+#: file and every scenario column is read against the same two numbers, so a result
+#: that stamped a scenario on the pair would be asserting an uncertainty the curve
+#: does not carry.  What the pair IS at a given row is a measurement — see
+#: :func:`envelope_scope`.
+ENVELOPE_COLUMNS: tuple[str, str] = ("unc_low", "unc_high")
+
+#: What produced an envelope, reported per row exactly like :data:`THRESHOLD_RULES`.
+#:   ``envelope_as_carried_in_the_curve`` — the two columns, converted with the SAME
+#:                                          conversion term and rule as the central.
+#:   ``not_applicable_F4``                — the row's threshold is ``-offset(t)``,
+#:                                          not its level, so converting the LEVEL's
+#:                                          envelope would put a bar on a quantity
+#:                                          nothing uses.
+#:   ``refused``                          — :class:`MissingEnvelopeError`; see
+#:                                          ``envelope_status``.
+ENVELOPE_RULES: tuple[str, ...] = (
+    "envelope_as_carried_in_the_curve",
+    "not_applicable_F4",
+    "refused",
+)
+
+#: What is and is not MACHINE-READABLE about where an edge came from.
+#:
+#: The previous literal here read ``"UNKNOWN:not_recorded_in_the_curve"``, and that
+#: overstated the gap on the very rows the headline number rests on.  Neither curve
+#: has an ``unc_source`` or ``unc_interp_flag`` COLUMN — that part is true, and it is
+#: what this constant now says.  But the ``note`` column DOES record the edges'
+#: sources in prose on the rows where it matters.  Measured on the Caspian curve, 5
+#: of 71 rows name ``unc_low`` / ``unc_high`` outright (20.0, 18.0, 17.4, 15.0,
+#: 14.0 ka) and 7 discuss the pair; the 15.0 ka note records that HESS2024 carries
+#: the reliably-dated level as a band "+22 to +35 m a.s.l. reliably dated to
+#: 18(17)-13 kyr BP", that +35 is its TOP EDGE, and that ``unc_low`` carries the
+#: +22 m bottom edge from Makshaev & Tkach; the 14.0 ka note records a carried
+#: conflict (``unc_low`` = +11 from Kurbanov et al. 2023 via HESS2024).
+#:
+#: Asserting "not recorded" where the curve records it is a FALSE PROVENANCE CLAIM,
+#: the same class of error as substituting a number.  So the claim made here is the
+#: one that survives measurement: the provenance is not machine-readable, and
+#: whether this particular row's note records it is stated per row by
+#: :func:`envelope_note_provenance`.
+#:
+#: Adding real ``unc_source`` / ``unc_interp_flag`` columns to the curve builder is
+#: still the fix, and it is still out of scope (that repo is read-only here).
+ENVELOPE_PROVENANCE_NO_COLUMN = (
+    "NOT_MACHINE_READABLE:the curve has no unc_source/unc_interp_flag column"
+)
+
+
+class MissingEnvelopeError(ValueError):
+    """This row's level envelope cannot be used, and will not be reconstructed.
+
+    Raised for all six ways the ``unc_low`` / ``unc_high`` pair can fail to be a
+    usable envelope, because every repair is a substitution that is
+    indistinguishable downstream from a measured one:
+
+    * a curve without the :data:`ENVELOPE_COLUMNS` at all;
+    * a NaN / non-numeric edge;
+    * an INVERTED pair (``unc_low > unc_high``);
+    * a DEGENERATE pair (``unc_low == unc_high``) — zero width.  That is not an
+      envelope, it is a claim of certainty wearing an envelope's clothes: it makes
+      the low, central and high verdicts identical by construction and every
+      robustness flag built on it unconditionally ``True``, so a reader sees three
+      agreeing verdicts where the file supplied one number.  Neither shipped curve
+      has such a row (measured), which is exactly why refusing costs nothing today
+      and catches a future edit;
+    * a pair that does not CONTAIN the central it was checked against — which really
+      happens: the Pontic catastrophic column reads -100.0 m at 9.0 / 8.5 / 8.0 /
+      7.5 ka against pairs of [-40, -30] ... [-27, -17], i.e. the pair was written
+      for the GRADUAL column and the catastrophic level sits 60-83 m below it.  Two
+      of those four (9.0 and 7.5 ka) are baked epochs;
+    * a converted edge outside :data:`_THRESHOLD_SANITY_RANGE_M` (a datum/unit
+      blow-up on the edge rather than on the central).
+
+    The tempting repairs are all forbidden and each has a measured cost.
+    Substituting the central collapses the triple back to the boolean this phase
+    exists to replace.  Borrowing the neighbouring row's pair is not a small error:
+    the Caspian envelope's WIDTH varies from 28 m to 2 m across the curve, and the
+    Pontic's from 75 m to 5 m.  Synthesizing a low-scenario COLUMN in the curve
+    instead is refused twice over — ``max(unc_low)`` = +22.0 m is below
+    :data:`MANYCH_SILL_M` = +23.0 m, so :func:`validate_basin_curve`'s Check A
+    rejects the file outright, and the vertical-datum contract's §8 requires the
+    frame conversion to happen at the THRESHOLD, not in the curve.
+    """
+
+
+def level_columns(df: pd.DataFrame) -> tuple[str, ...]:
+    """Every ``level_m_global_*`` column of *df*, in file order.
+
+    The set the envelope's scope is measured AGAINST, read from the file rather than
+    listed here — a curve that grows a seventh scenario must widen the measurement,
+    not silently fall outside it.
+    """
+    return tuple(str(c) for c in df.columns if str(c).startswith("level_m_global_"))
+
+
+def envelope_scope(
+    df: pd.DataFrame, idx: Any, low_m: float, high_m: float
+) -> tuple[tuple[str, ...], str]:
+    """Which level columns ``[low_m, high_m]`` actually brackets at row *idx*.
+
+    Returns ``(bracketed_columns, scope_sentence)``.  BOTH are measurements: nothing
+    here knows in advance that the Caspian pair is an inter-school envelope over all
+    six columns, or that the Pontic pair fails to contain ``catastrophic`` at four
+    rows.  It reads the row and says what it finds.
+
+    The sentence is what ships in the data.  It exists because a reader of
+    ``khvalynian_sill_test.csv`` who sees ``scenario=maximal`` beside
+    ``envelope_lo_f2_m=+17.1`` will otherwise read +17.1 as the maximal column's own
+    lower bound, and it is not: it is the bottom of a pair that also brackets
+    ``defensible``, ``late_rise``, ``early_rise`` and both aliases.
+    """
+    columns = level_columns(df)
+    bracketed = tuple(
+        col
+        for col in columns
+        if np.isfinite(v := float(pd.to_numeric(df.loc[idx, col], errors="coerce")))
+        and low_m - 1e-9 <= v <= high_m + 1e-9
+    )
+    short = tuple(c[len("level_m_global_") :] for c in bracketed)
+    if len(bracketed) == len(columns) and len(columns) > 1:
+        sentence = (
+            f"INTER-SCHOOL SCENARIO ENVELOPE: one (unc_low, unc_high) pair carried "
+            f"ONCE PER CURVE ROW and read identically for every scenario; measured "
+            f"here to bracket ALL {len(columns)} level columns of this curve "
+            f"({'|'.join(short)}).  It is NOT the uncertainty of any single "
+            f"scenario column, and an edge of it must not be read as that column's "
+            f"own bound."
+        )
+    else:
+        sentence = (
+            f"ROW-LEVEL PAIR, NOT AN ENVELOPE OVER THIS CURVE'S SCENARIOS: the one "
+            f"(unc_low, unc_high) pair this row carries brackets "
+            f"{len(bracketed)} of {len(columns)} level columns "
+            f"({'|'.join(short) if short else 'none'}); the rest fall outside it."
+        )
+    return bracketed, sentence
+
+
+def envelope_note_provenance(df: pd.DataFrame, idx: Any) -> tuple[bool, str]:
+    """Does THIS row's ``note`` record where its envelope edges came from?
+
+    Returns ``(recorded_in_note, statement)``.  Measured by looking for the edge
+    column names in the row's own free text, not assumed either way — the point of
+    this function is that the old blanket ``"UNKNOWN:not_recorded_in_the_curve"``
+    asserted an absence that the 15.0 and 14.0 ka notes contradict.
+
+    It deliberately does NOT parse a source out of the prose.  Prose is not a
+    machine-readable provenance and pretending otherwise would substitute a citation;
+    what ships is "the note names this edge — go read it" versus "the note is silent
+    about this edge", plus the standing fact that no ``unc_source`` column exists.
+    """
+    note = "" if "note" not in df.columns else str(df.loc[idx, "note"])
+    named = tuple(c for c in ENVELOPE_COLUMNS if c in note)
+    if named:
+        return True, (
+            f"{ENVELOPE_PROVENANCE_NO_COLUMN}; but THIS ROW's note names "
+            f"{','.join(named)} in prose and states where the edge comes from — read "
+            f"the note column, and do not report the provenance as absent"
+        )
+    return False, (
+        f"{ENVELOPE_PROVENANCE_NO_COLUMN}; and this row's note does not name either "
+        f"edge, so for THIS row the edge sources are genuinely unrecorded.  Other "
+        f"rows of the same curve do record theirs in prose"
+    )
+
+
+@dataclass(frozen=True)
+class LevelEnvelope:
+    """One curve ROW's ``unc_low`` / ``unc_high`` pair, as ABSOLUTE levels.
+
+    ``low_m`` and ``high_m`` are the curve's own two columns; nothing here is
+    symmetrised, re-centred or widened.
+
+    THERE IS NO ``scenario`` FIELD, and its absence is the fix.  The pair is a
+    property of the ROW: the same two numbers serve every level column, so stamping
+    a scenario on them asserted a per-scenario uncertainty the file does not carry.
+    What is per-scenario is only the containment CHECK — hence
+    :attr:`containment_checked_against`, which names the column whose central value
+    was verified to lie inside the pair, and :attr:`central_m`, that column's value.
+
+    :attr:`scope` and :attr:`bracketed_columns` say, per row and by measurement, how
+    many of the curve's level columns the pair really covers.
+    """
+
+    epoch_ka: float
+    #: The level column whose central was containment-checked.  NOT ownership.
+    containment_checked_against: str
+    basin: str
+    central_m: float
+    low_m: float
+    high_m: float
+    width_m: float
+    rule: str
+    provenance: str
+    #: Measured: the level columns this pair brackets at this row.
+    bracketed_columns: tuple[str, ...]
+    #: Measured: every level column the curve carries.
+    all_level_columns: tuple[str, ...]
+    #: The sentence that ships in the data.  See :func:`envelope_scope`.
+    scope: str
+    #: Measured: does this row's ``note`` name an edge column?
+    provenance_in_note: bool
+
+
+def basin_level_envelope(
+    df: pd.DataFrame,
+    epoch: float,
+    scenario: str = "gradual",
+    basin: str = "pontic",
+    *,
+    age_tol_ka: float = _CURVE_AGE_TOL_KA,
+) -> LevelEnvelope:
+    """The ROW-level envelope containing ``basin_level(df, epoch, scenario, basin)``.
+
+    Read straight out of :data:`ENVELOPE_COLUMNS` of the SAME row the level comes
+    from (:func:`_curve_row_index`), so a level and its envelope can never be taken
+    off different rows.
+
+    *scenario* selects the column whose central value is containment-checked and
+    reported as :attr:`LevelEnvelope.containment_checked_against`.  It does **not**
+    select an envelope: there is one pair per row and it is the same pair for every
+    scenario.
+
+    Raises
+    ------
+    CurveAgeGapError
+        The curve carries no row at this epoch.
+    MissingEnvelopeError
+        The pair is absent, NaN, inverted, degenerate, or does not contain the
+        central it was checked against.  See that class for why none is repaired.
+    """
+    col = f"level_m_global_{scenario}"
+    if col not in df.columns:
+        raise ValueError(
+            f"unknown scenario {scenario!r}; available columns={list(df.columns)}"
+        )
+    where = f"{float(epoch):g} ka / {scenario}"
+    missing = [c for c in ENVELOPE_COLUMNS if c not in df.columns]
+    if missing:
+        raise MissingEnvelopeError(
+            f"curve is missing {missing} at {where} — this curve carries no "
+            "uncertainty envelope at all, and one is not manufactured from the "
+            "central line or from a neighbouring row"
+        )
+    idx = _curve_row_index(df, epoch, age_tol_ka=age_tol_ka)
+    central = float(df.loc[idx, col])
+    lo_raw, hi_raw = (
+        pd.to_numeric(df.loc[idx, ENVELOPE_COLUMNS[0]], errors="coerce"),
+        pd.to_numeric(df.loc[idx, ENVELOPE_COLUMNS[1]], errors="coerce"),
+    )
+    lo, hi = float(lo_raw), float(hi_raw)
+    if not (np.isfinite(lo) and np.isfinite(hi)):
+        raise MissingEnvelopeError(
+            f"envelope edge is not a number at {where} "
+            f"({ENVELOPE_COLUMNS[0]}={df.loc[idx, ENVELOPE_COLUMNS[0]]!r}, "
+            f"{ENVELOPE_COLUMNS[1]}={df.loc[idx, ENVELOPE_COLUMNS[1]]!r}) — a "
+            "missing edge is not the central value and is not the neighbouring "
+            "row's edge"
+        )
+    if lo > hi:
+        raise MissingEnvelopeError(
+            f"envelope is inverted at {where}: {ENVELOPE_COLUMNS[0]}={lo:.1f} m is "
+            f"above {ENVELOPE_COLUMNS[1]}={hi:.1f} m.  Swapping them would silently "
+            "repair a data error whose direction is unknown"
+        )
+    if lo == hi:
+        raise MissingEnvelopeError(
+            f"envelope is degenerate at {where}: {ENVELOPE_COLUMNS[0]} == "
+            f"{ENVELOPE_COLUMNS[1]} == {lo:.1f} m, width 0.0 m.  A zero-width "
+            "envelope is not an uncertainty, it is a claim of CERTAINTY: it forces "
+            "the low, central and high verdicts to agree by construction and makes "
+            "every robustness flag built on it unconditionally True, so a reader "
+            "would see three independent-looking verdicts produced by one number.  "
+            "It is refused rather than reported with width_m=0.0"
+        )
+    if not lo <= central <= hi:
+        raise MissingEnvelopeError(
+            f"envelope does not contain the central it was checked against "
+            f"({col} = {central:.1f}, envelope [{lo:.1f}, {hi:.1f}])"
+        )
+    bracketed, scope = envelope_scope(df, idx, lo, hi)
+    in_note, provenance = envelope_note_provenance(df, idx)
+    return LevelEnvelope(
+        epoch_ka=float(epoch),
+        containment_checked_against=col,
+        basin=basin,
+        central_m=central,
+        low_m=lo,
+        high_m=hi,
+        width_m=hi - lo,
+        rule=ENVELOPE_RULES[0],
+        provenance=provenance,
+        bracketed_columns=bracketed,
+        all_level_columns=level_columns(df),
+        scope=scope,
+        provenance_in_note=in_note,
+    )
+
+
+def _convert_envelope(
+    envelope: LevelEnvelope, conversion_m: float, where: str
+) -> tuple[float, float]:
+    """Put both envelope edges in the DEM's frame with the SAME term as the central.
+
+    Contract §8 ("convert at the threshold, not in the curve") applies edge for edge:
+    an edge converted with a different ``conversion_m`` — a per-edge Δz for the
+    edge's own site, say — would make the envelope's WIDTH partly a GIA artefact.
+    The §6 update measures ``Δz(sill) - Δz(marker)`` on the band median at
+    +0.03..+0.18 m, i.e. below the 0.73 m of headroom the lower edge has at 16.0 ka
+    but not negligible against it; that is recorded in
+    :data:`ENVELOPE_PROVENANCE_NO_COLUMN`'s discussion and deliberately not modelled.
+
+    Raises :class:`MissingEnvelopeError` if a converted edge leaves
+    :data:`_THRESHOLD_SANITY_RANGE_M` — a blow-up on an edge is still a blow-up, and
+    the envelope is then unusable rather than clipped.
+    """
+    lo_t = envelope.low_m + float(conversion_m)
+    hi_t = envelope.high_m + float(conversion_m)
+    sane_lo, sane_hi = _THRESHOLD_SANITY_RANGE_M
+    for name, value in ((ENVELOPE_COLUMNS[0], lo_t), (ENVELOPE_COLUMNS[1], hi_t)):
+        if not np.isfinite(value) or not sane_lo <= value <= sane_hi:
+            raise MissingEnvelopeError(
+                f"converted envelope edge {name}={value:+.2f} m at {where} is "
+                f"outside the threshold sanity window "
+                f"{sane_lo:+.1f}..{sane_hi:+.1f} m — datum or unit blow-up on the "
+                "edge; the envelope is not clipped to fit"
+            )
+    return lo_t, hi_t
 
 
 # ---------------------------------------------------------------------------
@@ -999,6 +1621,42 @@ class BasinThreshold:
     n_cells: int | None
     marker_source: str
     provenance: str
+    # ── the ROW's level envelope, put in the same frame by the same term ──────
+    # ``None`` is a statement, and which statement it is lives in
+    # ``envelope_status``: an F4 row has no meaningful envelope on its threshold, a
+    # refused row has an unusable one.  The two must not be conflated, which is why
+    # there is a status string beside the four numbers rather than a lone ``None``.
+    #
+    # These are NOT per-scenario bounds even though this object carries a
+    # ``scenario``.  ``envelope_scope`` says so in words, on every row that has one.
+    envelope_lo_m: float | None = None
+    envelope_hi_m: float | None = None
+    threshold_envelope_lo_m: float | None = None
+    threshold_envelope_hi_m: float | None = None
+    envelope_status: str = "UNKNOWN:the envelope was not evaluated by this caller"
+    envelope_rule: str = "UNKNOWN:the envelope was not evaluated by this caller"
+    envelope_provenance: str = ENVELOPE_PROVENANCE_NO_COLUMN
+    envelope_scope: str = "UNKNOWN:the envelope was not evaluated by this caller"
+    # ── was this epoch's GIA field blended between two shipped ICE-6G epochs? ──
+    # An untagged interpolation is a substituted number, so it is a field and not a
+    # footnote.  ``False`` for every epoch either bake bakes today.
+    ice6g_interpolated: bool = False
+    ice6g_time_note: str = ""
+
+
+def _window_solid_displacement_at_shipped_epoch(
+    epoch: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """(Δz, modern Topo, lats, lons) at an epoch ICE-6G actually ships."""
+    win = _open_bs_window(epoch)
+    dz = solid_displacement(
+        win.topo_t,
+        win.topo_0,
+        win.offset,
+        sftgif_t=win.sftgif_t,
+        sftgif_0=win.sftgif_0,
+    )
+    return dz, win.topo_0, win.lats, win.lons
 
 
 def _window_solid_displacement(epoch: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -1013,16 +1671,24 @@ def _window_solid_displacement(epoch: float) -> tuple[np.ndarray, np.ndarray, np
     Δz@Bosphorus 11.979 m).  The residual inconsistency — a σ=2 raster compared
     against an unsmoothed threshold — is sub-metre over this window and is stated
     rather than hidden.
+
+    OFF-GRID EPOCHS (added 2026-08-03).  ICE-6G ships 0.5 ka steps to 21 ka, so
+    14.7 ka and 7.15 ka — rows the Pontic curve genuinely carries — and every
+    quarter-ka epoch of the Khvalynian window used to reach this function and get a
+    raw ``FileNotFoundError`` out of :func:`_open_bs_window`.  They are now blended
+    linearly in time between the two bracketing ICE-6G epochs, each endpoint
+    computed exactly, by the same :func:`_ice6g_bracket` the Khvalynian bake uses.
+    An epoch ICE-6G ships takes ``lo == hi`` and is bit-identical to before; an
+    epoch it does not ship is TAGGED ``ice6g_interpolated=True`` on the
+    :class:`BasinThreshold` it produces, because an untagged interpolation is a
+    substituted number.
     """
-    win = _open_bs_window(epoch)
-    dz = solid_displacement(
-        win.topo_t,
-        win.topo_0,
-        win.offset,
-        sftgif_t=win.sftgif_t,
-        sftgif_0=win.sftgif_0,
-    )
-    return dz, win.topo_0, win.lats, win.lons
+    lo, hi, w = _ice6g_bracket(epoch)
+    dz, topo_0, lats, lons = _window_solid_displacement_at_shipped_epoch(lo)
+    if lo != hi:
+        dz_hi, _t0, _la, _lo = _window_solid_displacement_at_shipped_epoch(hi)
+        dz = (1.0 - w) * dz + w * dz_hi
+    return dz, topo_0, lats, lons
 
 
 def _cell_index(lats: np.ndarray, lons: np.ndarray, lon: float, lat: float) -> tuple[int, int]:
@@ -1213,6 +1879,21 @@ def pontic_threshold(
     ~5.5 m at 22/18 ka and ~3.9 m at 10.9 ka.  Re-introducing it silently would
     undo the entire phase this function exists to close.
 
+    THE ENVELOPE IS CARRIED, NOT THRESHOLDED ON.  Both curve columns of
+    :data:`ENVELOPE_COLUMNS` are converted with the SAME ``conversion_m`` and the
+    same rule as the central line and reported as ``threshold_envelope_lo_m`` /
+    ``threshold_envelope_hi_m`` (contract §8: convert at the threshold, not in the
+    curve — edge for edge).  Nothing here thresholds on them, which is exactly why
+    this is the ONE site in the phase that CATCHES :class:`MissingEnvelopeError`
+    instead of propagating it: an unusable envelope is recorded in
+    ``envelope_status`` and the frame is still produced.  ``caspian_threshold`` does
+    not catch, because there the envelope drives a verdict.
+
+    The envelope's SCOPE is measured per row and reported in ``envelope_scope``.  On
+    this curve it is not an envelope over both scenarios at 9.0 / 8.5 / 8.0 / 7.5 ka
+    — the pair was written for ``gradual`` and does not contain ``catastrophic`` —
+    and at those rows the field says exactly that instead of implying a shared bound.
+
     Raises
     ------
     UnconvertibleThresholdError
@@ -1221,6 +1902,9 @@ def pontic_threshold(
         both columns, and the catastrophic column at 9.0 and 7.5 ka) now resolve
         by ``locus``, because the two papers behind them were read and their
         figures' graticules yielded documented AREAS, not coordinates.
+    CurveAgeGapError
+        The curve carries no row at this epoch.  Off-grid epochs used to take a
+        neighbouring row's level silently — 28.3 m at 16.75 ka — and now refuse.
     ValueError
         Unknown scenario, a curve without the marker columns, or a converted
         threshold outside :data:`_THRESHOLD_SANITY_RANGE_M`.
@@ -1239,11 +1923,13 @@ def pontic_threshold(
             "on a basin-wide constant."
         )
 
-    idx = (df["age_ka"] - float(epoch)).abs().idxmin()
+    idx = _curve_row_index(df, epoch)
     row = df.loc[idx]
     level = pontic_level(df, epoch, scenario)
     where = f"{float(epoch):g} ka / {scenario}"
     token = _marker_source_for_scenario(row["marker_source"], scenario)
+    interpolated = ice6g_is_interpolated(epoch)
+    time_note = _ice6g_time_note(epoch)
 
     # --- F4: the basin IS the ocean here; use the DEM's exact companion --------
     if token.startswith(_MARKER_NOT_APPLICABLE):
@@ -1266,8 +1952,100 @@ def pontic_threshold(
                 f"rule=ocean_offset frame=F4 {where}: reconnected basin, "
                 f"T = -offset(t) = {threshold:+.3f} m (exact, contract sec.2).  The CSV "
                 f"level {level:+.2f} m is a GLOBAL MEAN and is NOT used as the "
-                "threshold."
+                f"threshold.  envelope: {ENVELOPE_RULES[1]}.  {time_note}"
             ),
+            envelope_lo_m=None,
+            envelope_hi_m=None,
+            threshold_envelope_lo_m=None,
+            threshold_envelope_hi_m=None,
+            envelope_status=(
+                "NOT_APPLICABLE: this row's threshold is -offset(t), not its level, "
+                "so an envelope converted from the level column would be a bar on a "
+                "number nothing here uses"
+            ),
+            envelope_rule=ENVELOPE_RULES[1],
+            envelope_provenance=ENVELOPE_PROVENANCE_NO_COLUMN,
+            envelope_scope=(
+                "NOT_APPLICABLE: F4 row — the threshold is -offset(t), so the level "
+                "column's envelope brackets nothing this frame uses"
+            ),
+            ice6g_interpolated=interpolated,
+            ice6g_time_note=time_note,
+        )
+
+    # --- the envelope, for the F2 rules below ----------------------------------
+    # THE ONE DELIBERATE CATCH IN THIS PHASE.  ``basin_level_envelope`` raises and
+    # ``caspian_threshold`` lets it raise, because there the envelope DRIVES a
+    # verdict.  Here it does not: the Pontic threshold is the central line, the
+    # envelope is carried beside it for a reader, and refusing the whole frame over
+    # an unusable envelope would delete 39 correct frames plus the 13
+    # deliberately-wrong comparison frames over a number none of them thresholds on.
+    # So the refusal is RECORDED instead of raised — with the same message the
+    # exception carries, so the two cannot drift — and the four numeric fields stay
+    # ``None``.  This really fires: the catastrophic column at 9.0 / 8.5 / 8.0 /
+    # 7.5 ka carries -100 m against a pair written for the gradual column, and 9.0
+    # and 7.5 ka are baked epochs.
+    envelope: LevelEnvelope | None
+    try:
+        envelope = basin_level_envelope(df, epoch, scenario, basin="pontic")
+        envelope_status = "OK"
+        envelope_rule = ENVELOPE_RULES[0]
+        envelope_scope_text = envelope.scope
+        envelope_provenance = envelope.provenance
+    except MissingEnvelopeError as exc:
+        envelope = None
+        envelope_status = f"REFUSED: {exc}"
+        envelope_rule = ENVELOPE_RULES[2]
+        envelope_scope_text = f"REFUSED: no usable envelope at this row — {exc}"
+        envelope_provenance = ENVELOPE_PROVENANCE_NO_COLUMN
+
+    def _envelope_fields(conversion: float) -> dict[str, object]:
+        """The four envelope numbers converted with *conversion*, or four ``None``."""
+        if envelope is None:
+            return dict(
+                envelope_lo_m=None,
+                envelope_hi_m=None,
+                threshold_envelope_lo_m=None,
+                threshold_envelope_hi_m=None,
+                envelope_status=envelope_status,
+                envelope_rule=envelope_rule,
+                envelope_provenance=envelope_provenance,
+                envelope_scope=envelope_scope_text,
+            )
+        try:
+            lo_t, hi_t = _convert_envelope(envelope, conversion, where)
+        except MissingEnvelopeError as exc:
+            return dict(
+                envelope_lo_m=None,
+                envelope_hi_m=None,
+                threshold_envelope_lo_m=None,
+                threshold_envelope_hi_m=None,
+                envelope_status=f"REFUSED: {exc}",
+                envelope_rule=ENVELOPE_RULES[2],
+                envelope_provenance=envelope_provenance,
+                envelope_scope=f"REFUSED: the envelope did not convert — {exc}",
+            )
+        return dict(
+            envelope_lo_m=envelope.low_m,
+            envelope_hi_m=envelope.high_m,
+            threshold_envelope_lo_m=lo_t,
+            threshold_envelope_hi_m=hi_t,
+            envelope_status=envelope_status,
+            envelope_rule=envelope_rule,
+            envelope_provenance=envelope_provenance,
+            envelope_scope=envelope_scope_text,
+        )
+
+    def _envelope_note(fields: Mapping[str, object]) -> str:
+        if fields["threshold_envelope_lo_m"] is None:
+            return f"envelope: {fields['envelope_status']}"
+        return (
+            f"envelope [{fields['envelope_lo_m']:+.2f}.."
+            f"{fields['envelope_hi_m']:+.2f} m] -> "
+            f"[{fields['threshold_envelope_lo_m']:+.3f}.."
+            f"{fields['threshold_envelope_hi_m']:+.3f} m] "
+            f"(same conversion term as the central; {fields['envelope_scope']}; "
+            f"{fields['envelope_provenance']})"
         )
 
     # --- F2 rule 1: the row's own located marker.  Exact. ---------------------
@@ -1276,6 +2054,7 @@ def pontic_threshold(
         lon, lat = position
         dz, block = marker_solid_displacement(epoch, lon, lat)
         threshold = _check_threshold_sanity(level + dz, where)
+        fields = _envelope_fields(float(dz))
         return BasinThreshold(
             epoch_ka=float(epoch),
             scenario=scenario,
@@ -1292,8 +2071,11 @@ def pontic_threshold(
                 f"rule=marker frame=F2 {where}: T = level({level:+.2f} m) + "
                 f"dz({dz:+.3f} m) @ {lon:.4f}E/{lat:.4f}N = {threshold:+.3f} m "
                 f"[3x3 cell spread {level + block[0]:+.3f}..{level + block[1]:+.3f} m]"
-                f" ({token})"
+                f" ({token}); {_envelope_note(fields)}; {time_note}"
             ),
+            ice6g_interpolated=interpolated,
+            ice6g_time_note=time_note,
+            **fields,
         )
 
     # --- F2 rule 2: no marker, but a DOCUMENTED locus + its p5-p95 bar --------
@@ -1301,6 +2083,7 @@ def pontic_threshold(
     if locus_name is not None:
         median, (p5, p95), n_cells = locus_solid_displacement(epoch, locus_name)
         threshold = _check_threshold_sanity(level + median, where)
+        fields = _envelope_fields(float(median))
         return BasinThreshold(
             epoch_ka=float(epoch),
             scenario=scenario,
@@ -1318,8 +2101,11 @@ def pontic_threshold(
                 f"dz({median:+.3f} m, median over locus {locus_name!r}, "
                 f"{n_cells} cells) = {threshold:+.3f} m "
                 f"[p5-p95 {level + p5:+.3f}..{level + p95:+.3f} m] - "
-                f"{_LOCI[locus_name].why}"
+                f"{_LOCI[locus_name].why}; {_envelope_note(fields)}; {time_note}"
             ),
+            ice6g_interpolated=interpolated,
+            ice6g_time_note=time_note,
+            **fields,
         )
 
     # --- F2 rule 3: neither.  Refuse. ----------------------------------------
@@ -1413,8 +2199,16 @@ def sea_surface_offset(epoch: float) -> float:
 
     Exact, with no uniformity assumption: whatever local sea-surface residual is
     baked into ``Δz_engine`` cancels against the same scalar on the other side.
+
+    Linear in time between shipped ICE-6G epochs (:func:`_ice6g_bracket`), so the
+    F4 rows the Pontic curve carries off the ICE-6G grid — 14.7 and 7.15 ka — resolve
+    instead of raising ``FileNotFoundError``.  Every epoch on the grid is read
+    exactly, as before.
     """
-    return _open_bs_window(epoch).offset
+    lo, hi, w = _ice6g_bracket(epoch)
+    if lo == hi:
+        return _open_bs_window(lo).offset
+    return (1.0 - w) * _open_bs_window(lo).offset + w * _open_bs_window(hi).offset
 
 
 def gia_delta_subset(
@@ -1720,6 +2514,16 @@ def preflight_thresholds(
     discipline as :func:`check_spratt_coverage`: a frame that cannot be put into
     the DEM's vertical frame must be discovered before the run half-fills an
     output tree, not on epoch 7 of 13.
+
+    :class:`CurveAgeGapError` is collected here alongside
+    :class:`UnconvertibleThresholdError` (2026-08-03) because both are the same kind
+    of answer — *this frame has no defensible threshold* — and a caller sweeping a
+    grid finer than the curve (an animation) needs the refusal as DATA, one row per
+    frame, rather than as a traceback that stops the sweep at the first gap.  The
+    stored string is prefixed with the class name so the two are never confused: a
+    missing curve row and an unconvertible level want different fixes.  All 13
+    shipped epochs land on exact rows, so this changes nothing about the bake:
+    26/26 resolve, 0 unconvertible.
     """
     epochs = EPOCHS_KA if epochs is None else epochs
     resolved: dict[tuple[float, str], BasinThreshold] = {}
@@ -1730,8 +2534,8 @@ def preflight_thresholds(
                 resolved[(epoch, scenario)] = pontic_threshold(
                     pontic_df, epoch, scenario
                 )
-            except UnconvertibleThresholdError as exc:
-                unconvertible[(epoch, scenario)] = str(exc)
+            except (UnconvertibleThresholdError, CurveAgeGapError) as exc:
+                unconvertible[(epoch, scenario)] = f"{type(exc).__name__}: {exc}"
     return resolved, unconvertible
 
 

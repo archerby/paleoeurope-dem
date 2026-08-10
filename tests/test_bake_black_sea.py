@@ -1,5 +1,7 @@
 # tests/test_bake_black_sea.py
 """Unit tests for bake_black_sea helpers (no data files required)."""
+import ast
+import dataclasses
 import hashlib
 import importlib
 import inspect
@@ -1769,3 +1771,600 @@ def test_registering_the_loci_left_the_twenty_already_baked_thresholds_untouched
     ):
         t = b.pontic_threshold(df, epoch, "gradual")
         assert t.threshold_m == pytest.approx(want, abs=0.005), epoch
+
+
+# ===========================================================================
+# T3 — the two curve-reading guards, and the band on the Pontic side
+#
+# Both guards were LATENT SUBSTITUTIONS, and neither changes a number this bake
+# has ever produced: all 13 shipped epochs land on exact curve rows and on exact
+# ICE-6G epochs.  What changes is what happens OFF that grid, which is where the
+# animation is going.
+# ===========================================================================
+
+
+def _real_curve_or_skip():
+    if not b.PONTIC_CSV.exists():
+        pytest.skip(f"real Pontic curve not available: {b.PONTIC_CSV}")
+    return pd.read_csv(b.PONTIC_CSV, comment="#")
+
+
+# --- guard 1: the nearest-age lookup is bounded -----------------------------
+
+
+def test_basin_level_refuses_a_far_row():
+    """16.75 ka used to silently take -58.3 m; it now refuses.
+
+    The 17.0 and 16.5 ka rows are EQUIDISTANT from 16.75 ka and read -58.3 m and
+    -30.0 m, so ``idxmin`` returned whichever came first in the DataFrame — 28.3 m
+    of threshold decided by row order.  Neither is defensible: the two rows are not
+    even the same kind of number (a five-study seismic-wedge lowstand vs the modern
+    Bosphorus sill depth used as an overflow proxy), so there is nothing to pick
+    between and nothing to interpolate.
+    """
+    df = _real_curve_or_skip()
+    # the substitution that used to happen, still visible in the data
+    assert float(df.loc[df["age_ka"] == 17.0, "level_m_global_gradual"].iloc[0]) == -58.3
+    assert float(df.loc[df["age_ka"] == 16.5, "level_m_global_gradual"].iloc[0]) == -30.0
+    with pytest.raises(b.CurveAgeGapError, match="no row at 16.75 ka"):
+        b.basin_level(df, 16.75, "gradual")
+    # ...and the epochs the curve DOES carry are unaffected
+    assert b.basin_level(df, 17.0, "gradual") == pytest.approx(-58.3)
+    assert b.basin_level(df, 16.5, "gradual") == pytest.approx(-30.0)
+
+
+def test_the_age_tolerance_cannot_reach_a_second_row():
+    """0.01 ka is the curves' own age resolution and is below half their spacing.
+
+    The tightest ADJACENT spacing is 0.05 ka in the Caspian curve and 0.10 ka in
+    the Pontic one, so the tolerance can never make the lookup ambiguous by a
+    hair — which is why it can be this tight without being arbitrary.
+    """
+    assert b._CURVE_AGE_TOL_KA == 0.01
+    df = _real_curve_or_skip()
+    ages = np.sort(pd.to_numeric(df["age_ka"]).to_numpy(dtype=float))
+    spacing = np.diff(ages)
+    assert float(spacing[spacing > 0].min()) >= 2 * b._CURVE_AGE_TOL_KA
+
+
+def test_a_tiny_age_offset_is_still_the_same_row():
+    """Float noise must not become a refusal: 16.5 +/- 1e-9 is the 16.5 ka row."""
+    df = _real_curve_or_skip()
+    assert b.basin_level(df, 16.5 + 1e-9, "gradual") == pytest.approx(-30.0)
+    assert b.basin_level(df, 16.5 - 1e-9, "gradual") == pytest.approx(-30.0)
+
+
+def test_duplicate_ages_that_disagree_are_refused_rather_than_ordered():
+    """The other way row order used to decide a level."""
+    dup = pd.DataFrame(
+        {
+            "age_ka": [9.0, 9.0, 0.0],
+            "level_m_global_gradual": [-35.0, -60.0, 0.0],
+            "level_m_global_catastrophic": [-100.0, -100.0, 0.0],
+        }
+    )
+    with pytest.raises(b.CurveAgeGapError, match="disagree"):
+        b.basin_level(dup, 9.0, "gradual")
+    # identical duplicates are not a conflict and still resolve
+    same = dup.copy()
+    same.loc[1, "level_m_global_gradual"] = -35.0
+    assert b.basin_level(same, 9.0, "gradual") == pytest.approx(-35.0)
+
+
+def test_the_age_guard_is_not_an_assert_statement():
+    """``assert`` is stripped under python -O; this guard protects a threshold."""
+    src = inspect.getsource(b._curve_row_index) + inspect.getsource(b.basin_level)
+    assert "assert " not in src
+
+
+def test_every_shipped_epoch_still_lands_on_an_exact_row():
+    """The guard costs this bake nothing, and that is asserted rather than hoped."""
+    df = _real_curve_or_skip()
+    ages = pd.to_numeric(df["age_ka"]).to_numpy(dtype=float)
+    for epoch in b.EPOCHS_KA:
+        assert float(np.abs(ages - epoch).min()) == 0.0, epoch
+
+
+# --- guard 2: off-grid ICE-6G epochs, tagged rather than fatal ---------------
+
+
+def test_pontic_quarter_ka_epoch_resolves():
+    """14.7 ka: a row the curve HAS, at an epoch ICE-6G does not ship.
+
+    RECONCILED FROM THE BRIEF, which named 16.75 ka for this test.  16.75 ka
+    cannot be the case: the Pontic curve has no row there either (its grid is the
+    same 0.5 ka as ICE-6G's), so the honest answer at 16.75 is the refusal the
+    test above pins, not a threshold.  14.7 and 7.15 ka are the epochs where the
+    curve genuinely carries a level and only the GIA file is missing — which is
+    exactly the defect item 9 describes, and there are 2 such rows, not 8.
+
+    The value is a cross-check as well as a smoke test: -17.278 m reproduces the
+    contract's own sec.5a-bis per-row figure of -17.28 m for 14.7 ka, measured
+    independently and by a different route.
+    """
+    df = _real_curve_or_skip()
+    if not (b.ICE6G_DIR / b._epoch_filename(14.5)).exists():
+        pytest.skip("real ICE-6G not available")
+    assert 14.7 not in b.ice6g_ages_ka()
+    assert float(np.abs(pd.to_numeric(df["age_ka"]) - 14.7).min()) == 0.0
+
+    t = b.pontic_threshold(df, 14.7, "gradual")
+    assert t.rule == "marker"
+    assert t.threshold_m == pytest.approx(-17.28, abs=0.01)
+    assert t.ice6g_interpolated is True
+    assert "linear in time between ICE-6G 14.5 and 15 ka" in t.ice6g_time_note
+    assert t.ice6g_time_note in t.provenance
+
+
+def test_an_on_grid_epoch_is_not_tagged_as_interpolated():
+    df = _real_curve_or_skip()
+    if not (b.ICE6G_DIR / b._epoch_filename(16.5)).exists():
+        pytest.skip("real ICE-6G not available")
+    t = b.pontic_threshold(df, 16.5, "gradual")
+    assert t.ice6g_interpolated is False
+    assert "no time interpolation" in t.ice6g_time_note
+    assert t.threshold_m == pytest.approx(-18.02, abs=5e-3)
+
+
+def test_the_f4_rule_also_survives_an_off_grid_epoch():
+    """7.15 ka is F4 and off the ICE-6G grid, so ``-offset(t)`` had to blend too."""
+    df = _real_curve_or_skip()
+    if not (b.ICE6G_DIR / b._epoch_filename(7.0)).exists():
+        pytest.skip("real ICE-6G not available")
+    t = b.pontic_threshold(df, 7.15, "gradual")
+    assert t.rule == "ocean_offset"
+    assert t.ice6g_interpolated is True
+    blend = 0.7 * b.sea_surface_offset(7.0) + 0.3 * b.sea_surface_offset(7.5)
+    assert t.threshold_m == pytest.approx(-blend, abs=1e-9)
+
+
+def test_the_bracket_blend_is_linear_and_exact_at_its_endpoints():
+    if not (b.ICE6G_DIR / b._epoch_filename(16.5)).exists():
+        pytest.skip("real ICE-6G not available")
+    assert b._ice6g_bracket(16.5) == (16.5, 16.5, 0.0)
+    assert b.ice6g_is_interpolated(16.5) is False
+    lo, hi, w = b._ice6g_bracket(16.25)
+    assert (lo, hi) == (16.0, 16.5) and w == pytest.approx(0.5)
+    assert b.ice6g_is_interpolated(16.25) is True
+    mid = 0.5 * (b.sea_surface_offset(16.0) + b.sea_surface_offset(16.5))
+    assert b.sea_surface_offset(16.25) == pytest.approx(mid, abs=1e-9)
+
+
+def test_the_ice6g_age_cache_is_keyed_on_the_directory():
+    """A module-level path that tests repoint must not be cached once, globally.
+
+    A single-slot cache would answer a question about one ICE-6G distribution with
+    the contents of another — the same class of error as reading a level off the
+    wrong row.
+    """
+    assert b._ice6g_ages_in.cache_info() is not None
+    src = inspect.getsource(b.ice6g_ages_ka)
+    assert "_ice6g_ages_in(ICE6G_DIR)" in src
+
+
+# --- the ROW ENVELOPE: read, converted with the central's own term, or refused --
+
+
+def test_envelope_columns_are_the_two_the_curves_carry():
+    assert b.ENVELOPE_COLUMNS == ("unc_low", "unc_high")
+    assert b.ENVELOPE_RULES == (
+        "envelope_as_carried_in_the_curve",
+        "not_applicable_F4",
+        "refused",
+    )
+
+
+def test_the_provenance_constant_no_longer_asserts_an_absence():
+    """C3.  ``UNKNOWN:not_recorded_in_the_curve`` was a FALSE provenance claim.
+
+    The curves have no ``unc_source`` / ``unc_interp_flag`` COLUMN — that is what
+    the constant may say, and all it may say.  The ``note`` column DOES record the
+    edges' sources in prose on the rows the headline number rests on, so a blanket
+    "not recorded in the curve" asserted an absence the file contradicts, which is
+    the same class of error as substituting a number.
+    """
+    assert b.ENVELOPE_PROVENANCE_NO_COLUMN == (
+        "NOT_MACHINE_READABLE:the curve has no unc_source/unc_interp_flag column"
+    )
+    assert "not_recorded_in_the_curve" not in b.ENVELOPE_PROVENANCE_NO_COLUMN
+    assert not hasattr(b, "BAND_PROVENANCE")
+    # The retired literal may still be QUOTED in a comment or a docstring recording
+    # why it was withdrawn — that is the audit trail.  What it may not be is
+    # EMITTED, so the scan is over string literals that are not docstrings: no
+    # string this module ships to a reader may carry the false claim.
+    tree = ast.parse(Path(b.__file__).read_text(encoding="utf-8"))
+    docstrings = set()
+    for node in ast.walk(tree):
+        if isinstance(
+            node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ) and (doc := ast.get_docstring(node, clean=False)) is not None:
+            docstrings.add(doc)
+    emitted = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and "UNKNOWN:not_recorded_in_the_curve" in node.value
+        and node.value not in docstrings
+    ]
+    assert not emitted, emitted
+    env = b.basin_level_envelope(_envelope_df(-40.0, -30.0), 9.0)
+    assert "not_recorded_in_the_curve" not in env.provenance
+
+
+def test_the_note_column_records_edge_provenance_on_the_caspian_rows_that_matter():
+    """C3, measured on the real file rather than asserted.
+
+    The 15.0 ka note names ``unc_low`` and where it comes from; the 14.0 ka note
+    records a carried conflict on the same edge.  Both are rows the spill window
+    depends on.  A provenance statement that says "not recorded" over these is
+    false, so :func:`envelope_note_provenance` reports per row.
+    """
+    csv = (
+        b.PALEO_DATA_ROOT
+        / "docs"
+        / "superpowers"
+        / "research"
+        / "2026-07-28-caspian-khvalynian-level-curve.csv"
+    )
+    if not csv.exists():
+        pytest.skip("Caspian curve not available")
+    df = pd.read_csv(csv, comment="#")
+    named = sorted(
+        float(df.loc[i, "age_ka"])
+        for i in df.index
+        if b.envelope_note_provenance(df, i)[0]
+    )
+    assert named == [14.0, 15.0, 17.4, 18.0, 20.0]
+    in_note, statement = b.envelope_note_provenance(
+        df, b._curve_row_index(df, 15.0)
+    )
+    assert in_note
+    assert "unc_low" in statement and "do not report the provenance as absent" in statement
+    assert b.ENVELOPE_PROVENANCE_NO_COLUMN in statement
+    # ... and a row whose note is silent says so, without claiming the curve is.
+    quiet, quiet_statement = b.envelope_note_provenance(
+        df, b._curve_row_index(df, 16.5)
+    )
+    assert not quiet
+    assert "Other rows of the same curve do record theirs in prose" in quiet_statement
+
+
+def test_the_caspian_pair_is_an_envelope_over_every_level_column():
+    """C1, the headline, measured: one pair per ROW bracketing all six columns.
+
+    This is what makes it an INTER-SCHOOL SCENARIO ENVELOPE rather than the
+    uncertainty of any one scenario — at 16.0 ka it brackets ``defensible`` +35.0
+    and ``maximal`` +48.0 at the same time.
+    """
+    csv = (
+        b.PALEO_DATA_ROOT
+        / "docs"
+        / "superpowers"
+        / "research"
+        / "2026-07-28-caspian-khvalynian-level-curve.csv"
+    )
+    if not csv.exists():
+        pytest.skip("Caspian curve not available")
+    df = pd.read_csv(csv, comment="#")
+    columns = b.level_columns(df)
+    assert len(columns) == 6
+    for i in df.index:
+        lo = float(df.loc[i, "unc_low"])
+        hi = float(df.loc[i, "unc_high"])
+        bracketed, scope = b.envelope_scope(df, i, lo, hi)
+        assert bracketed == columns, float(df.loc[i, "age_ka"])
+        assert scope.startswith("INTER-SCHOOL SCENARIO ENVELOPE")
+        assert "NOT the uncertainty of any single scenario column" in scope
+    row = b._curve_row_index(df, 16.0)
+    assert (float(df.loc[row, "unc_low"]), float(df.loc[row, "unc_high"])) == (
+        22.0,
+        50.0,
+    )
+    assert float(df.loc[row, "level_m_global_defensible"]) == 35.0
+    assert float(df.loc[row, "level_m_global_maximal"]) == 48.0
+
+
+def test_the_pontic_pair_is_NOT_an_envelope_over_both_its_columns():
+    """The scope is a MEASUREMENT, and here it measures the other answer.
+
+    Same code, same two column names, different curve: at 9.0 / 8.5 / 8.0 / 7.5 ka
+    the Pontic pair was written for ``gradual`` and does not contain
+    ``catastrophic``, so the scope sentence must NOT claim a shared envelope.
+    """
+    df = _real_curve_or_skip()
+    for epoch in (9.0, 8.5, 8.0, 7.5):
+        i = b._curve_row_index(df, epoch)
+        lo, hi = float(df.loc[i, "unc_low"]), float(df.loc[i, "unc_high"])
+        bracketed, scope = b.envelope_scope(df, i, lo, hi)
+        assert bracketed == ("level_m_global_gradual",), epoch
+        assert scope.startswith("ROW-LEVEL PAIR, NOT AN ENVELOPE"), epoch
+        assert "brackets 1 of 2 level columns" in scope, epoch
+    # ... and where it does contain both, it says so.
+    i = b._curve_row_index(df, 16.5)
+    _cols, scope = b.envelope_scope(
+        df, i, float(df.loc[i, "unc_low"]), float(df.loc[i, "unc_high"])
+    )
+    assert scope.startswith("INTER-SCHOOL SCENARIO ENVELOPE")
+
+
+def test_the_envelope_object_carries_no_scenario_of_its_own():
+    """C1 as an API fact: there is no ``LevelEnvelope.scenario`` to stamp.
+
+    ``scenario`` selects only the column whose central is containment-CHECKED, and
+    the field that records that is named for what it is.  A field called
+    ``scenario`` on a row-level object is what let the report assert a per-scenario
+    band in the first place.
+    """
+    fields = {f.name for f in dataclasses.fields(b.LevelEnvelope)}
+    assert "scenario" not in fields
+    assert "containment_checked_against" in fields
+    assert {"scope", "bracketed_columns", "all_level_columns"} <= fields
+    env = b.basin_level_envelope(_envelope_df(-40.0, -30.0), 9.0, "gradual")
+    assert env.containment_checked_against == "level_m_global_gradual"
+
+
+def test_band_that_does_not_contain_its_central_is_refused():
+    # NAME KEPT VERBATIM from the phase brief's C-BAND acceptance table, even
+    # though the object is now called an envelope: that table is the acceptance
+    # contract and a renamed assertion is an unrun one.  The FIELDS are renamed;
+    # this identifier is a handle the gate holds.
+    """The Pontic catastrophic column at 9.0 / 8.5 / 8.0 / 7.5 ka.
+
+    The pair there was written for the GRADUAL column; the catastrophic level is
+    -100 m, 60-83 m below it.  Two of the four (9.0 and 7.5 ka) are BAKED epochs,
+    so this is not a hypothetical.  The frame is still produced — the Pontic
+    threshold does not depend on the envelope — and the refusal is recorded instead
+    of raised, with all four numeric fields ``None``.
+    """
+    df = _real_curve_or_skip()
+    if not (b.ICE6G_DIR / b._epoch_filename(9.0)).exists():
+        pytest.skip("real ICE-6G not available")
+    want = {
+        9.0: "level_m_global_catastrophic = -100.0, envelope [-40.0, -30.0]",
+        8.5: "level_m_global_catastrophic = -100.0, envelope [-35.0, -25.0]",
+        8.0: "level_m_global_catastrophic = -100.0, envelope [-30.0, -20.0]",
+        7.5: "level_m_global_catastrophic = -100.0, envelope [-27.0, -17.0]",
+    }
+    for epoch, detail in want.items():
+        t = b.pontic_threshold(df, epoch, "catastrophic")
+        assert t.envelope_status == (
+            "REFUSED: envelope does not contain the central it was checked against "
+            f"({detail})"
+        ), epoch
+        assert t.envelope_rule == "refused", epoch
+        assert (
+            t.envelope_lo_m,
+            t.envelope_hi_m,
+            t.threshold_envelope_lo_m,
+            t.threshold_envelope_hi_m,
+        ) == (None, None, None, None), epoch
+        # the frame itself is still produced, on the central line
+        assert t.threshold_m == pytest.approx(t.level_m + t.conversion_m)
+        assert t.envelope_status in t.provenance, epoch
+        assert "REFUSED" in t.envelope_scope, epoch
+
+
+def test_the_envelope_status_is_per_column_not_per_row():
+    """The two columns of the same row land on two DIFFERENT statuses.
+
+    Measured, and it explains the defect rather than merely recording it: by 8.0 ka
+    the gradual column has already reconnected, so it is F4 and its threshold is
+    ``-offset(t)`` — nothing there uses the level's envelope at all.  The pair
+    sitting in those rows brackets that gradual line ([-30, -20] at 8.0 ka), and the
+    only column still asking for one is the catastrophic one, which is a deep lake
+    at -100 m.  Hence a pair 70 m away from the central it is paired with.
+    """
+    df = _real_curve_or_skip()
+    if not (b.ICE6G_DIR / b._epoch_filename(8.0)).exists():
+        pytest.skip("real ICE-6G not available")
+    grad = b.pontic_threshold(df, 8.0, "gradual")
+    cat = b.pontic_threshold(df, 8.0, "catastrophic")
+    assert grad.frame == "F4" and grad.envelope_rule == "not_applicable_F4"
+    assert cat.frame == "F2" and cat.envelope_rule == "refused"
+    row = df.loc[b._curve_row_index(df, 8.0)]
+    assert (float(row["unc_low"]), float(row["unc_high"])) == (-30.0, -20.0)
+    assert float(row["level_m_global_gradual"]) == -25.0
+    assert float(row["level_m_global_catastrophic"]) == -100.0
+
+
+def test_an_f4_row_gets_four_none_envelope_fields_and_its_own_rule():
+    """Converting the LEVEL's envelope on a row whose threshold is -offset(t) would
+    put a bar on a number nothing uses."""
+    df = _real_curve_or_skip()
+    if not (b.ICE6G_DIR / b._epoch_filename(5.0)).exists():
+        pytest.skip("real ICE-6G not available")
+    t = b.pontic_threshold(df, 5.0, "gradual")
+    assert t.rule == "ocean_offset" and t.frame == "F4"
+    assert t.envelope_rule == "not_applicable_F4"
+    assert (
+        t.envelope_lo_m,
+        t.envelope_hi_m,
+        t.threshold_envelope_lo_m,
+        t.threshold_envelope_hi_m,
+    ) == (None, None, None, None)
+    assert "NOT_APPLICABLE" in t.envelope_status
+    assert "NOT_APPLICABLE" in t.envelope_scope
+
+
+def test_both_envelope_edges_are_converted_with_the_central_s_own_term():
+    """Contract sec.8, edge for edge — one conversion term for all three."""
+    df = _real_curve_or_skip()
+    if not (b.ICE6G_DIR / b._epoch_filename(16.5)).exists():
+        pytest.skip("real ICE-6G not available")
+    for epoch in (22, 18, 16.5, 14.5, 12):
+        t = b.pontic_threshold(df, epoch, "gradual")
+        assert t.envelope_rule == "envelope_as_carried_in_the_curve", epoch
+        assert t.threshold_envelope_lo_m - t.envelope_lo_m == pytest.approx(
+            t.conversion_m
+        ), epoch
+        assert t.threshold_m - t.level_m == pytest.approx(t.conversion_m), epoch
+        assert t.threshold_envelope_hi_m - t.envelope_hi_m == pytest.approx(
+            t.conversion_m
+        ), epoch
+        assert b.ENVELOPE_PROVENANCE_NO_COLUMN in t.envelope_provenance
+        assert t.envelope_scope, epoch
+
+
+def _envelope_df(low, high, level=-35.0):
+    return pd.DataFrame(
+        {
+            "age_ka": [9.0, 0.0],
+            "level_m_global_gradual": [level, 0.0],
+            "level_m_global_catastrophic": [-100.0, 0.0],
+            "unc_low": [low, -5.0],
+            "unc_high": [high, 0.0],
+        }
+    )
+
+
+def test_a_missing_nan_or_inverted_envelope_edge_raises():
+    """Three ways an envelope fails to be one.  None of them is repaired."""
+    with pytest.raises(b.MissingEnvelopeError, match="carries no"):
+        b.basin_level_envelope(
+            _envelope_df(-40.0, -30.0).drop(columns=["unc_low"]), 9.0
+        )
+    with pytest.raises(b.MissingEnvelopeError, match="not a number"):
+        b.basin_level_envelope(_envelope_df(np.nan, -30.0), 9.0)
+    with pytest.raises(b.MissingEnvelopeError, match="inverted"):
+        b.basin_level_envelope(_envelope_df(-30.0, -40.0), 9.0)
+
+
+def test_a_degenerate_envelope_is_refused_rather_than_reported_as_width_zero():
+    """C6.  ``unc_low == unc_high == central`` passed every check and reported 0.0 m.
+
+    That is a band asserting CERTAINTY: it forces low == central == high, so
+    ``verdict_is_envelope_robust`` is unconditionally True and the triple stops
+    being three independent readings.  Neither shipped curve has such a row, which
+    is why refusing costs nothing today and catches a future edit.
+    """
+    with pytest.raises(b.MissingEnvelopeError, match="degenerate"):
+        b.basin_level_envelope(_envelope_df(-35.0, -35.0), 9.0)
+    exc = pytest.raises(
+        b.MissingEnvelopeError, b.basin_level_envelope, _envelope_df(-35.0, -35.0), 9.0
+    )
+    assert "claim of CERTAINTY" in str(exc.value)
+    assert "width 0.0 m" in str(exc.value)
+    # neither shipped curve is degenerate anywhere — the measurement, not a hope
+    df = _real_curve_or_skip()
+    assert not (
+        pd.to_numeric(df["unc_low"]) == pd.to_numeric(df["unc_high"])
+    ).any()
+
+
+def test_a_usable_envelope_reports_its_width_and_its_measured_scope():
+    env = b.basin_level_envelope(_envelope_df(-40.0, -30.0), 9.0)
+    assert (env.low_m, env.central_m, env.high_m) == (-40.0, -35.0, -30.0)
+    assert env.width_m == pytest.approx(10.0)
+    assert env.rule == "envelope_as_carried_in_the_curve"
+    assert b.ENVELOPE_PROVENANCE_NO_COLUMN in env.provenance
+    # the fixture's catastrophic column is -100 m, outside [-40, -30]
+    assert env.bracketed_columns == ("level_m_global_gradual",)
+    assert env.scope.startswith("ROW-LEVEL PAIR, NOT AN ENVELOPE")
+
+
+def test_the_envelope_is_read_off_the_same_row_as_the_level():
+    """One lookup, so a level and its envelope can never come from different rows."""
+    src = inspect.getsource(b.basin_level_envelope)
+    assert "_curve_row_index(" in src
+    with pytest.raises(b.CurveAgeGapError):
+        b.basin_level_envelope(_envelope_df(-40.0, -30.0), 5.0)
+
+
+def test_a_blown_up_envelope_edge_is_refused_not_clipped():
+    """A datum/unit error on an EDGE is still a datum/unit error."""
+    env = b.LevelEnvelope(
+        epoch_ka=9.0,
+        containment_checked_against="level_m_global_gradual",
+        basin="pontic",
+        central_m=-35.0,
+        low_m=-3500.0,
+        high_m=-30.0,
+        width_m=3470.0,
+        rule=b.ENVELOPE_RULES[0],
+        provenance=b.ENVELOPE_PROVENANCE_NO_COLUMN,
+        bracketed_columns=("level_m_global_gradual",),
+        all_level_columns=("level_m_global_gradual",),
+        scope="test",
+        provenance_in_note=False,
+    )
+    with pytest.raises(b.MissingEnvelopeError, match="sanity window"):
+        b._convert_envelope(env, 10.0, "9 ka / gradual")
+
+
+def test_the_envelope_never_falls_back_on_the_central_or_a_neighbour():
+    """The two substitutions the class names, asserted as absences in the source."""
+    src = inspect.getsource(b.basin_level_envelope) + inspect.getsource(
+        b.pontic_threshold
+    )
+    for forbidden in ("unc_low.fillna", "unc_high.fillna", ".ffill(", ".bfill(", "interpolate("):
+        assert forbidden not in src
+    doc = b.MissingEnvelopeError.__doc__ or ""
+    assert "neighbouring row" in doc and "28 m to 2 m" in doc
+
+
+def test_duplicate_rows_that_disagree_on_the_MARKER_are_ambiguous_too():
+    """C9.  The scan used to check levels and edges and ignore the marker.
+
+    A marker decides ``conversion_m``, i.e. the whole F2 -> F1 term, so two rows
+    that agree on every number and name different markers are exactly as ambiguous
+    as two that disagree on a level — and which one applied was decided by
+    DataFrame row order.  Neither shipped curve has duplicate ages (asserted), so
+    this changes no shipped number.
+    """
+    df = pd.DataFrame(
+        {
+            "age_ka": [9.0, 9.0],
+            "level_m_global_gradual": [-35.0, -35.0],
+            "unc_low": [-40.0, -40.0],
+            "unc_high": [-30.0, -30.0],
+            "marker_lon": [29.10, 29.33],
+            "marker_lat": [41.20, 44.13],
+            "marker_source": ["Bosphorus sill", "BLVK9814"],
+        }
+    )
+    with pytest.raises(b.CurveAgeGapError, match="marker_lon"):
+        b._curve_row_index(df, 9.0)
+    # identical markers on both rows are not ambiguous
+    same = df.copy()
+    same.loc[1, ["marker_lon", "marker_lat", "marker_source"]] = [
+        29.10,
+        41.20,
+        "Bosphorus sill",
+    ]
+    assert b._curve_row_index(same, 9.0) in (0, 1)
+    real = _real_curve_or_skip()
+    assert not pd.to_numeric(real["age_ka"]).duplicated().any()
+
+
+# --- the plain bake still runs ----------------------------------------------
+
+
+def test_preflight_still_resolves_every_frame_with_the_envelope_in_place():
+    """26/26, 0 unconvertible: none of the above may cost the bake a frame."""
+    df = _real_curve_or_skip()
+    if not (b.ICE6G_DIR / b._epoch_filename(16.5)).exists():
+        pytest.skip("real ICE-6G not available")
+    resolved, unconvertible = b.preflight_thresholds(df)
+    assert len(resolved) == len(b.EPOCHS_KA) * len(b.SCENARIOS) == 26
+    assert unconvertible == {}
+    # ... including the four frames whose envelope is refused
+    for epoch in (9.0, 7.5):
+        assert resolved[(epoch, "catastrophic")].envelope_rule == "refused"
+
+
+def test_preflight_records_a_missing_curve_row_instead_of_dying_on_it():
+    """An animation sweeping a grid finer than the curve needs the refusal as DATA.
+
+    One row per frame, prefixed with the class name so a missing row and an
+    unconvertible level — which want different fixes — are never confused.
+    """
+    df = _real_curve_or_skip()
+    if not (b.ICE6G_DIR / b._epoch_filename(16.5)).exists():
+        pytest.skip("real ICE-6G not available")
+    resolved, unconvertible = b.preflight_thresholds(df, epochs=[16.5, 16.75])
+    assert set(resolved) == {(16.5, "gradual"), (16.5, "catastrophic")}
+    assert set(unconvertible) == {(16.75, "gradual"), (16.75, "catastrophic")}
+    for message in unconvertible.values():
+        assert message.startswith("CurveAgeGapError: ")
+        assert "no row at 16.75 ka" in message
