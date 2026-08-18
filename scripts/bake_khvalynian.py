@@ -471,12 +471,112 @@ SILL_REPORT_CSV = OUT_BASE / "khvalynian_sill_test.csv"
 # Scene geometry
 # ---------------------------------------------------------------------------
 
-#: Scene bbox = the working raster's own extent.  Stated as constants rather than
-#: read from the file so that _require_model_grid_brackets_tile has something to
+#: Scene bbox = the working raster's own extent.  Stated in CODE rather than read
+#: from the file so that :func:`_require_model_grid_brackets_tile` has something to
 #: check the raster AGAINST, and so a swapped raster is caught instead of silently
 #: redefining the scene.
-LAT_MIN, LAT_MAX = 36.0, 54.0
-LON_MIN, LON_MAX = 25.5, 58.0
+#:
+#: TWO working rasters now exist and the second is not a replacement: the 58 E / 54 N
+#: tile is what the shipped 43-epoch Khvalynian set was baked on, and the 60 E / 62 N
+#: tile is the drainage_implied window.  Reading the bbox off whichever file happens
+#: to be configured would make both of those scenes unreproducible from the code and
+#: would hand the guard its own input to check itself against.  So the pairing is a
+#: TABLE: a raster this table does not name is REFUSED, by filename, before anything
+#: opens it.
+#:
+#: 60 E is not a design choice.  It is the eastern edge of the GEBCO 2024 tile this
+#: project holds (``gebco_2024_n75.0_s25.0_w-15.0_e60.0.tif``); the window cannot be
+#: widened past it from this source, whatever the science would prefer.
+KHV_SCENES: dict[str, tuple[float, float, float, float]] = {
+    # filename: (LAT_MIN, LAT_MAX, LON_MIN, LON_MAX)
+    "gebco_2024_khvalynian_pontic_n54.0_s36.0_w25.5_e58.0_cog.tif": (36.0, 54.0, 25.5, 58.0),
+    "gebco_2024_khvalynian_pontic_n62.0_s36.0_w25.5_e60.0_cog.tif": (36.0, 62.0, 25.5, 60.0),
+}
+
+
+def _scene_for(dem_path: Path) -> tuple[float, float, float, float]:
+    """The declared scene bbox for *dem_path*, or a refusal.
+
+    Refusing an unnamed raster is the point.  The alternative -- defaulting to the
+    historical 58 E / 54 N box -- would bake a wider tile's northern and eastern
+    margin with 0 m of GIA, which ``apply_gia_delta``'s ``fill_value=0.0`` produces
+    silently and which is indistinguishable from a measured zero over stable
+    far-field ground.  :func:`_require_model_grid_brackets_tile` catches exactly
+    that case downstream; this catches it before the first byte is read.
+    """
+    name = Path(dem_path).name
+    try:
+        return KHV_SCENES[name]
+    except KeyError:
+        raise SystemExit(
+            "REFUSING an unknown working raster: %r.\n"
+            "The scene bbox lives in KHV_SCENES, not in the file, so that a swapped "
+            "raster cannot silently redefine the scene. Known rasters:\n  %s\n"
+            "If this really is a new scene, add it to KHV_SCENES with its bbox "
+            "written out, and re-read the note there about 60 E being the GEBCO "
+            "tile's own eastern edge."
+            % (name, "\n  ".join(sorted(KHV_SCENES)))
+        ) from None
+
+
+LAT_MIN, LAT_MAX, LON_MIN, LON_MAX = _scene_for(KHV_DEM)
+
+
+def _require_tile_is_the_declared_scene(src) -> None:
+    """Refuse a raster whose extent is not the bbox :data:`KHV_SCENES` declares.
+
+    The comment above KHV_SCENES has always said "a swapped raster is caught
+    instead of silently redefining the scene", and until this function existed
+    that was only half true.  ``_require_model_grid_brackets_tile`` catches a tile
+    that reaches OUTSIDE the GIA window; a tile that is SMALLER than the declared
+    box sails through it, because a smaller tile is bracketed even more
+    comfortably.  The failure that leaves is quiet: every downstream consumer --
+    the crop of record, the sill probe's window, the nodata census, the basin
+    fields' ``row_off`` -- computes its rows and columns from LAT_MIN..LAT_MAX,
+    so a short raster yields a frame that is internally consistent, correctly
+    tagged, and about the wrong ground.
+
+    Tolerance is half a pixel: the bbox is stated in whole degrees and the grid is
+    15 arcsec, so anything the same scene can legitimately differ by is far below
+    it, and anything bigger is a different raster.
+
+    SCOPE, stated rather than left to be discovered.  This checks a raster that
+    CLAIMS to be a declared scene -- i.e. whose filename is a key of
+    :data:`KHV_SCENES` -- against the bbox declared for that key.  A raster with
+    any other name is passed through untouched, because it is not making the
+    claim: ``build_paleo_dem`` is called with small synthetic tiles by the unit
+    tests, and demanding that a fixture covering 43-45 E / 45-47 N be the whole
+    Caspian scene is a category error, not a guard.  The swapped-raster case this
+    exists for is a file replaced UNDER a declared name, and that is exactly what
+    is checked.  An undeclared raster is still bounded by
+    :func:`_require_model_grid_brackets_tile`, and ``KHV_DEM`` itself cannot be
+    undeclared -- :func:`_scene_for` refuses it at import.
+
+    It also reads the bbox from the table entry rather than from the module-level
+    ``LAT_MIN``/``LON_MIN``, so that a caller baking a second scene explicitly
+    cannot be checked against the first one's box.
+    """
+    declared_bbox = KHV_SCENES.get(Path(getattr(src, "name", "")).name)
+    if declared_bbox is None:
+        return
+    lat_min, lat_max, lon_min, lon_max = declared_bbox
+    half_px = max(abs(src.res[0]), abs(src.res[1])) / 2.0
+    declared = {"W": lon_min, "S": lat_min, "E": lon_max, "N": lat_max}
+    actual = {"W": src.bounds.left, "S": src.bounds.bottom,
+              "E": src.bounds.right, "N": src.bounds.top}
+    off = {k: actual[k] - declared[k] for k in declared
+           if abs(actual[k] - declared[k]) > half_px}
+    if off:
+        raise ValueError(
+            "the DEM tile is not the scene KHV_SCENES declares for it. Declared "
+            "W=%g S=%g E=%g N=%g; the raster reads W=%g S=%g E=%g N=%g; edges off "
+            "by more than half a pixel (%.6g deg): %s. Either the file was swapped "
+            "under its name, or KHV_SCENES is wrong about it -- do not proceed on "
+            "the assumption that one of them is close enough."
+            % (lon_min, lat_min, lon_max, lat_max,
+               actual["W"], actual["S"], actual["E"], actual["N"], half_px,
+               ", ".join("%s%+.6g" % (k, v) for k, v in sorted(off.items())))
+        )
 
 #: Region buffer (deg) for the ICE-6G subset around the scene bbox.
 BUF = 1.0
@@ -3052,6 +3152,7 @@ def build_paleo_dem(
 
     with rasterio.open(dem_path) as src:
         tile_lats, tile_lons = _tile_coordinates(src)
+        _require_tile_is_the_declared_scene(src)
         _require_model_grid_brackets_tile(model_lats, model_lons, tile_lats, tile_lons)
         src_nodata = src.nodata
         profile = {
