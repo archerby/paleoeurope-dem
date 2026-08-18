@@ -31,6 +31,7 @@ in this repo today, and the AST scan is what keeps it that way.
 from __future__ import annotations
 
 import ast
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -43,7 +44,27 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # The two curve files that carry a `#` header block.  Both live in the sibling
 # viewer repo; both are optional from this repo's point of view, so every test
 # that touches one skips rather than fails when it is absent.
-PONTIC_CSV = rbsc.BLACK_SEA_CSV
+#
+# They used to be reached through ``rbsc.BLACK_SEA_CSV``, which is still a
+# hardcoded ``D:\…`` literal inside the script (that constant is flagged STALE in
+# ``render_black_sea_corrected.py`` and is deliberately not being re-pointed by
+# this change).  Taking the path from the script meant BOTH parametrised tests
+# skipped on every non-Windows box even where the CSVs are present -- so the
+# location is resolved here through the same ``PALEO_DATA_ROOT`` indirection the
+# rest of the repo uses, and the coupling to the script's own constant is kept
+# alive by ``test_the_script_still_points_at_the_curve_this_module_checks``.
+_DEFAULT_PALEO_DATA_ROOT = REPO_ROOT.parents[1] / "Paleo-Europe_3D"
+_PALEO_DATA_ROOT = Path(
+    os.environ.get("PALEO_DATA_ROOT") or _DEFAULT_PALEO_DATA_ROOT
+).resolve()
+
+#: Relative to the Paleo-Europe_3D tree; this is the tail ``rbsc.BLACK_SEA_CSV``
+#: spells out absolutely.
+_CURVE_DIR_PARTS = ("docs", "superpowers", "research")
+PONTIC_CSV_NAME = "2026-06-21-black-sea-level-curve.csv"
+
+_CURVE_DIR = _PALEO_DATA_ROOT.joinpath(*_CURVE_DIR_PARTS)
+PONTIC_CSV = _CURVE_DIR / PONTIC_CSV_NAME
 CASPIAN_CSV = (
     PONTIC_CSV.parent / "2026-07-28-caspian-khvalynian-level-curve.csv"
 )
@@ -51,8 +72,29 @@ CASPIAN_CSV = (
 
 def _require(path: Path) -> Path:
     if not path.exists():
-        pytest.skip(f"sibling-repo curve CSV not available here: {path}")
+        pytest.skip(
+            f"sibling-repo curve CSV not available here: {path} "
+            "(set PALEO_DATA_ROOT to the Paleo-Europe_3D tree)"
+        )
     return path
+
+
+def test_the_script_still_points_at_the_curve_this_module_checks():
+    """The tests below read a path they build themselves.  This is the one place
+    that ties it back to ``rbsc.BLACK_SEA_CSV``.
+
+    Without it, re-pointing the script at a different curve would leave every
+    test in this file green while checking a file the script no longer opens.
+    ``rbsc.BLACK_SEA_CSV`` is a Windows-spelled literal, so it is compared as
+    text with both separators rather than as a ``Path``.
+    """
+    spelled = str(rbsc.BLACK_SEA_CSV).replace("\\", "/")
+    assert spelled.endswith("/".join((*_CURVE_DIR_PARTS, PONTIC_CSV_NAME))), (
+        f"render_black_sea_corrected.BLACK_SEA_CSV is {rbsc.BLACK_SEA_CSV!r}, "
+        f"which is no longer …/{'/'.join(_CURVE_DIR_PARTS)}/{PONTIC_CSV_NAME} — "
+        "this module is checking a file the script does not read"
+    )
+    assert str(rbsc.load_bs_curve.__defaults__[0]) == str(rbsc.BLACK_SEA_CSV)
 
 
 # ---------------------------------------------------------------------------

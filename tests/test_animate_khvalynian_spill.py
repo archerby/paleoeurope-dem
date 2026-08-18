@@ -52,14 +52,20 @@ _dataset = pytest.mark.skipif(
     ),
 )
 
+# Same ``PALEO_DATA_ROOT``-with-a-repo-relative-fallback indirection as
+# ``scripts/bake_black_sea.py``.  The fallback used to be a hardcoded ``D:\…``
+# literal, which made this gate unsatisfiable on any non-Windows box that had not
+# set the env var, whatever was actually on disk.
+_REPO_ROOT_FOR_DATA = Path(__file__).resolve().parents[1]
+_DEFAULT_PALEO_DATA_ROOT = _REPO_ROOT_FOR_DATA.parents[1] / "Paleo-Europe_3D"
+PALEO_DATA_ROOT = Path(
+    os.environ.get("PALEO_DATA_ROOT") or _DEFAULT_PALEO_DATA_ROOT
+)
+
 _needs_curves = pytest.mark.skipif(
-    not (
-        Path(
-            os.environ.get("PALEO_DATA_ROOT")
-            or r"D:\pasha\RESEARCH\Paleo-Europe_3D"
-        ).exists()
-    ),
-    reason="needs the Paleo-Europe_3D curve CSVs",
+    not PALEO_DATA_ROOT.exists(),
+    reason=f"needs the Paleo-Europe_3D curve CSVs under {PALEO_DATA_ROOT} "
+           "(set PALEO_DATA_ROOT)",
 )
 
 
@@ -2400,6 +2406,8 @@ class TestWhatWasActuallyShipped:
             if frame["refusal"]:
                 assert frame["threshold"] is None
                 assert "CurveAgeGapError" in frame["refusal"]
+                self._skip_if_the_recorded_spelling_is_foreign_to_this_platform(
+                    frame["canvas_frame"])
                 assert Path(frame["canvas_frame"]).exists()
 
     def test_neither_grid_can_be_mistaken_for_the_other(self):
@@ -2426,6 +2434,8 @@ class TestWhatWasActuallyShipped:
             assert frame["canvas_frame_sha256_reverified"] == by_epoch[
                 frame["epoch_ka"]
             ]
+            self._skip_if_the_recorded_spelling_is_foreign_to_this_platform(
+                frame["canvas_frame"])
             assert anim.sha256_of(frame["canvas_frame"]) == by_epoch[
                 frame["epoch_ka"]
             ], "the shipped canvas PNG no longer hashes to what the manifest records"
@@ -2567,6 +2577,47 @@ class TestWhatWasActuallyShipped:
             assert manifest["canvas"]["size_px"] != list(anim.FALLBACK_CANVAS_PX)
 
     @staticmethod
+    def _skip_if_the_recorded_spelling_is_foreign_to_this_platform(value):
+        """Skip iff the MANIFEST'S OWN recorded path cannot be dereferenced here.
+
+        ``animate_khvalynian_spill.PATH_SPELLING_DECISION`` records the project's
+        verdict: a manifest carries BOTH the drive-letter and the UNC spelling,
+        plus a ``drive_map`` measured at write time, "so a value elsewhere in this
+        file that carries only one spelling can be converted with no guessing".
+        That machinery converts between two WINDOWS spellings.  On Linux the same
+        bytes live at a third location which the manifest does not record, and
+        nothing in the file can produce it.
+
+        So the property these four assertions check -- *the path this manifest
+        tells a reader to chase is really there* -- is here neither true nor
+        false: it is **unobservable**, the same third state the renderer itself
+        refuses to collapse for a water body that touches the edge of the extent.
+        Re-rooting the string onto ``SHIPPED_ROOT`` would be a guess dressed as a
+        measurement, and at the ``self_contained`` site it would be circular: that
+        test asserts the manifest's own absolute path lands inside the deliverable,
+        which a re-root makes true by construction.
+
+        The condition is keyed on the ARTIFACT, not on ``os.name``.  When this
+        deliverable is next rendered on Linux it will record POSIX paths, these
+        assertions will start executing on their own, and nobody has to remember
+        to remove a platform flag.
+        """
+        raw = str(value["as_written"] if isinstance(value, dict) else value)
+        foreign = None
+        if os.name != "nt" and (re.match(r"^[A-Za-z]:[\\/]", raw) or raw.startswith("\\\\")):
+            foreign = "a Windows drive-letter or UNC path, read on POSIX"
+        elif os.name == "nt" and raw.startswith("/"):
+            foreign = "a POSIX absolute path, read on Windows"
+        if foreign:
+            pytest.skip(
+                "the shipped manifest records %r -- %s. Both spellings the manifest "
+                "carries (see PATH_SPELLING_DECISION) are Windows spellings; the "
+                "third location these bytes occupy on this machine is not in the "
+                "file, so this assertion is UNOBSERVABLE here rather than false. "
+                "Re-render the deliverable on this platform and it runs by itself."
+                % (raw, foreign))
+
+    @staticmethod
     def _path(value):
         """A path key, in whichever spelling the manifest that wrote it used.
 
@@ -2588,6 +2639,8 @@ class TestWhatWasActuallyShipped:
             assert len(
                 animation["gif_frame_durations_ms_read_back_with_pil"]
             ) == manifest["n_frames"]
+            self._skip_if_the_recorded_spelling_is_foreign_to_this_platform(
+                animation["gif"])
             assert self._path(animation["gif"]).exists()
             assert manifest["palette"]["gif_audit"][
                 "n_frames_with_a_local_color_table"
@@ -2624,6 +2677,8 @@ class TestWhatWasActuallyShipped:
         assert block["bytes_copied"] > 0
         root = SHIPPED_ROOT / "spill_0.5ka_9_epochs"
         for frame in manifest["frames"]:
+            self._skip_if_the_recorded_spelling_is_foreign_to_this_platform(
+                frame["canvas_frame"])
             local = Path(frame["canvas_frame"])
             assert local.exists(), local
             assert local.parent == root / "canvas"
@@ -2754,6 +2809,76 @@ class TestWhatWasActuallyShipped:
 
 # ---------------------------------------------------------------------------
 @_dataset
+class TestTheForeignSpellingSkipIsKeyedOnTheArtifactNotThePlatform:
+    """A skip that cannot stop skipping is a deleted test.
+
+    ``_skip_if_the_recorded_spelling_is_foreign_to_this_platform`` exists so four
+    assertions about the shipped manifest stop reporting FALSE on Linux for a
+    property that is merely UNOBSERVABLE there.  The danger of such a helper is
+    that it quietly swallows the assertions forever.  These tests plant both
+    answers and prove it distinguishes them: a Windows spelling read on POSIX is
+    skipped, and a POSIX spelling read on POSIX is NOT -- so the day this
+    deliverable is re-rendered here, the four assertions resume with no flag to
+    remember and no line to delete.
+    """
+
+    _skip = staticmethod(
+        TestWhatWasActuallyShipped
+        ._skip_if_the_recorded_spelling_is_foreign_to_this_platform)
+
+    @pytest.mark.skipif(os.name == "nt", reason="asserts the POSIX-side behaviour")
+    def test_a_windows_spelling_is_skipped_on_posix(self):
+        for planted in (r"Y:\paleo\renders\x\frame_00_17ka.png",
+                        r"C:/tmp/frame.png",
+                        r"\\192.168.88.250\Storage\paleo\renders\x\frame.png",
+                        {"as_written": r"Y:\paleo\renders\x\anim.gif",
+                         "resolved": r"\\192.168.88.250\Storage\paleo\x\anim.gif"}):
+            # pytest's Skipped derives from BaseException, NOT Exception -- the
+            # first version of this test used pytest.raises(Exception), so the
+            # skip escaped the context manager and turned THIS test into a skip.
+            # It reported green while asserting nothing. Caught by reading the
+            # suite's own skip list and finding a planted path in it.
+            with pytest.raises(pytest.skip.Exception):
+                self._skip(planted)
+
+    @pytest.mark.skipif(os.name == "nt", reason="asserts the POSIX-side behaviour")
+    def test_a_posix_spelling_is_NOT_skipped_on_posix(self):
+        """The load-bearing half.  If this ever starts skipping, the four
+        assertions have been silently removed from the suite."""
+        for planted in ("/mnt/tank/paleo/renders/khvalynian_spill_animation/x.png",
+                        {"as_written":
+                         "/mnt/tank/paleo/renders/khvalynian_spill_animation/a.gif",
+                         "resolved":
+                         "/mnt/tank/paleo/renders/khvalynian_spill_animation/a.gif"}):
+            self._skip(planted)  # must simply return
+
+    @pytest.mark.skipif(os.name != "nt", reason="asserts the Windows-side behaviour")
+    def test_a_posix_spelling_is_skipped_on_windows(self):
+        with pytest.raises(pytest.skip.Exception):
+            self._skip("/mnt/tank/paleo/renders/x.png")
+
+    @pytest.mark.skipif(os.name != "nt", reason="asserts the Windows-side behaviour")
+    def test_a_windows_spelling_is_NOT_skipped_on_windows(self):
+        self._skip(r"Y:\paleo\renders\khvalynian_spill_animation\x.png")
+
+    def test_the_shipped_manifests_are_what_actually_triggers_this(self):
+        """Not a synthetic check: read the real deliverable and state which side
+        of the fork it falls on, so the reason recorded here is the reason that
+        actually applies to the artifact on disk."""
+        if SHIPPED_ROOT is None or not SHIPPED_ROOT.exists():
+            pytest.skip("the shipped deliverable is not reachable from here")
+        manifest = json.loads(
+            (SHIPPED_ROOT / "spill_0.5ka_9_epochs" / "sequence_manifest.json")
+            .read_text(encoding="utf-8"))
+        recorded = str(manifest["frames"][0]["canvas_frame"])
+        looks_windows = bool(re.match(r"^[A-Za-z]:[\\/]", recorded)
+                             or recorded.startswith("\\\\"))
+        assert looks_windows or recorded.startswith("/"), (
+            "the manifest records %r, which is neither spelling this helper knows "
+            "how to classify -- the helper must be taught it rather than defaulting"
+            % recorded)
+
+
 class TestOnTheRealRasters:
 
     def test_all_seventeen_rasters_exist(self):

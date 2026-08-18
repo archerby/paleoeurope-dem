@@ -19,6 +19,7 @@ old formula cannot be reintroduced by retuning a bound.
 """
 from __future__ import annotations
 
+import os
 import warnings
 from pathlib import Path
 
@@ -376,7 +377,24 @@ def test_smoothing_does_not_leak_ice_surface_values_across_the_margin():
 # Real ICE-6G_C data
 # ===========================================================================
 
-ICE6G_DIR = Path(r"D:/pasha/RESEARCH/Paleo-Europe_3D/data/raw/ICE6G")
+# Resolved through ``PALEO_DATA_ROOT`` with a repo-relative fallback -- the same
+# indirection ``scripts/bake_black_sea.py`` uses and ``tests/test_gia.py`` /
+# ``tests/test_ice6g_loader_ice_guard.py`` already reuse.  Until 2026-08-18 this
+# was a hardcoded ``D:/…`` literal, so all ten real-data tests below skipped
+# *silently* on every non-Windows box (CT 129 paleo-compute included) while the
+# suite still reported green -- the 48 ``I6_C.VM5a_10min.*.nc`` files were sitting
+# right there under ``$PALEO_DATA_ROOT/data/raw/ICE6G`` the whole time.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_DEFAULT_PALEO_DATA_ROOT = _REPO_ROOT.parents[1] / "Paleo-Europe_3D"
+
+
+def _resolve_ice6g_raw_dir() -> Path:
+    """Directory holding ``I6_C.VM5a_10min.<epoch>.nc``, env-overridable."""
+    root = Path(os.environ.get("PALEO_DATA_ROOT") or _DEFAULT_PALEO_DATA_ROOT)
+    return root.resolve() / "data" / "raw" / "ICE6G"
+
+
+ICE6G_DIR = _resolve_ice6g_raw_dir()
 
 #: All 48 shipped epochs: 0–20.5 ka at 0.5 ka, then 21–26 ka at 1 ka.
 ALL_EPOCHS: tuple[float, ...] = tuple(
@@ -385,8 +403,48 @@ ALL_EPOCHS: tuple[float, ...] = tuple(
 
 requires_ice6g = pytest.mark.skipif(
     not (ICE6G_DIR / "I6_C.VM5a_10min.18.nc").exists(),
-    reason="ICE-6G data not present",
+    reason=f"ICE-6G data not present under {ICE6G_DIR} "
+           "(set PALEO_DATA_ROOT to the Paleo-Europe_3D tree)",
 )
+
+
+class TestIce6gDirResolution:
+    """The real-data path must be resolvable off this box, not only on D:.
+
+    Without these, re-hardcoding a drive letter above turns the ten real-data
+    tests in this module back into silent skips on every other machine.
+    """
+
+    def test_no_hardcoded_drive_absolute_paths_in_this_module(self):
+        """The needles are assembled at runtime so this does not match itself."""
+        src = Path(__file__).read_text(encoding="utf-8")
+        drive = "D" + ":"
+        for sep in ("/", "\\"):
+            needle = drive + sep + "pasha"
+            assert needle not in src, (
+                f"drive-absolute path {needle!r} in test_gia_topo.py"
+            )
+
+    def test_default_is_repo_relative(self, monkeypatch):
+        """The expected side spells the sibling name out rather than reusing
+        ``_DEFAULT_PALEO_DATA_ROOT`` — reusing it makes both sides move together
+        and the assertion becomes a tautology (caught by mutation on 2026-08-18:
+        renaming the default to ``Paleo-Europe_3D_MUTANT`` still passed).
+
+        ``.resolve()`` is applied because the actual side resolves: on CT 129
+        ``/opt/Paleo-Europe_3D`` is a symlink to ``/opt/paleo/Paleo-Europe_3D``.
+        """
+        monkeypatch.delenv("PALEO_DATA_ROOT", raising=False)
+        assert _resolve_ice6g_raw_dir() == (
+            (_REPO_ROOT.parents[1] / "Paleo-Europe_3D").resolve()
+            / "data" / "raw" / "ICE6G"
+        )
+
+    def test_paleo_data_root_env_redirects_the_raw_dir(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("PALEO_DATA_ROOT", str(tmp_path / "tank"))
+        assert _resolve_ice6g_raw_dir() == (
+            (tmp_path / "tank").resolve() / "data" / "raw" / "ICE6G"
+        )
 
 
 def _epoch_file(epoch: float) -> Path:

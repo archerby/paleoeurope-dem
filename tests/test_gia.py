@@ -665,10 +665,23 @@ class TestIce6gRawDirResolution:
             assert needle not in src, f"drive-absolute path {needle!r} in test_gia.py"
 
     def test_default_is_repo_relative(self, monkeypatch):
-        """Without the env var the sibling ``Paleo-Europe_3D`` tree is used."""
+        """Without the env var the sibling ``Paleo-Europe_3D`` tree is used.
+
+        The expected side is ``.resolve()``d because the actual one is:
+        ``_resolve_ice6g_raw_dir`` resolves the root, and on CT 129 paleo-compute
+        ``/opt/Paleo-Europe_3D`` is a symlink to ``/opt/paleo/Paleo-Europe_3D``, so
+        the two are one directory under two spellings and the old assertion failed
+        on the spelling alone.  Resolving both sides keeps the check that matters:
+        a default pointing at a DIFFERENT directory still fails.
+
+        The sibling name is spelled out here rather than taken from
+        ``_DEFAULT_PALEO_DATA_ROOT``: reusing that name moves both sides of the
+        assertion together and the test degenerates into a tautology.
+        """
         monkeypatch.delenv("PALEO_DATA_ROOT", raising=False)
         assert _resolve_ice6g_raw_dir() == (
-            _REPO_ROOT.parents[1] / "Paleo-Europe_3D" / "data" / "raw" / "ICE6G"
+            (_REPO_ROOT.parents[1] / "Paleo-Europe_3D").resolve()
+            / "data" / "raw" / "ICE6G"
         )
 
     def test_paleo_data_root_env_redirects_the_raw_dir(self, monkeypatch, tmp_path):

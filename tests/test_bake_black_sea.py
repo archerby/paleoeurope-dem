@@ -603,13 +603,44 @@ def test_level_guard_survives_python_dash_O():
 # ---------------------------------------------------------------------------
 
 
-def test_roots_default_to_historical_repo_relative_locations():
-    """Unset env vars must reproduce today's paths, expressed repo-relatively."""
-    assert b.PALEO_DATA_ROOT == _REPO_ROOT.parents[1] / "Paleo-Europe_3D"
-    assert b.PALEO_OUT_ROOT == _REPO_ROOT.parent
-    assert b.OUT_BASE == _REPO_ROOT.parent / "black_sea_corrected" / "topo"
-    assert b.ICE6G_DIR == b.PALEO_DATA_ROOT / "data" / "raw" / "ICE6G"
-    assert b.BS_DEM == b.PALEO_DATA_ROOT / "data" / "raw" / "GEBCO" / "bs_gmrt_bsproper.tif"
+def test_roots_default_to_historical_repo_relative_locations(monkeypatch):
+    """Unset env vars must reproduce today's paths, expressed repo-relatively.
+
+    TWO THINGS THIS USED TO GET WRONG, both found on CT 129 paleo-compute
+    (2026-08-18), where the repo lives at ``/opt/paleo/paleoeurope-dem`` and
+    ``/opt/Paleo-Europe_3D`` is a symlink to ``/opt/paleo/Paleo-Europe_3D``:
+
+    1. It read ``b.PALEO_DATA_ROOT`` / ``b.PALEO_OUT_ROOT`` as imported, i.e. with
+       whatever ``PALEO_DATA_ROOT`` / ``PALEO_OUT_ROOT`` the shell happened to
+       export -- so a test whose whole subject is the DEFAULT was reporting on the
+       override.  The env is now cleared and the module reloaded, the same way
+       ``test_paleo_*_env_redirects_*`` below does it in the other direction.
+    2. It compared a ``.resolve()``d actual against an unresolved expected.  On a
+       box where any component of the sibling path is a symlink those are two
+       spellings of one directory and the assertion fails on the spelling.  The
+       expected side is resolved too, so the check still fails if the default
+       points at a *different* directory -- which is the thing it is for.
+    """
+    monkeypatch.delenv("PALEO_DATA_ROOT", raising=False)
+    monkeypatch.delenv("PALEO_OUT_ROOT", raising=False)
+    reloaded = importlib.reload(b)
+    try:
+        assert reloaded.PALEO_DATA_ROOT == (
+            _REPO_ROOT.parents[1] / "Paleo-Europe_3D"
+        ).resolve()
+        assert reloaded.PALEO_OUT_ROOT == _REPO_ROOT.parent.resolve()
+        assert reloaded.OUT_BASE == (
+            _REPO_ROOT.parent / "black_sea_corrected" / "topo"
+        ).resolve()
+        assert reloaded.ICE6G_DIR == (
+            reloaded.PALEO_DATA_ROOT / "data" / "raw" / "ICE6G"
+        )
+        assert reloaded.BS_DEM == (
+            reloaded.PALEO_DATA_ROOT / "data" / "raw" / "GEBCO" / "bs_gmrt_bsproper.tif"
+        )
+    finally:
+        monkeypatch.undo()
+        importlib.reload(b)
 
 
 def test_no_hardcoded_drive_absolute_paths_in_module():
