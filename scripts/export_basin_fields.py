@@ -232,13 +232,33 @@ MIN_FREE_BYTES = 8 * 1024 * 1024 * 1024
 # D-A — the crop
 # ---------------------------------------------------------------------------
 
-#: THE OWNER'S DECISION, 2026-08-05: crop the frame north at this latitude.
+#: THE OWNER'S DECISION, 2026-08-18: crop the frame north at this latitude.
+#: Supersedes the decision of 2026-08-05, which set it to 51.0.
 #:
 #: It is deliberately NOT the measured minimum.  :func:`survey_nodata` measures
 #: what the minimum is; :func:`crop_record` reports the difference between the
 #: two on every raster written, so the choice can be revisited against the number
-#: instead of against a memory of it.
-CROP_NORTH_LAT_DEG = 51.0
+#: instead of against a memory of it.  That reporting is what made this revision
+#: possible: the run's own log stated how much the 51.0 bound discarded beyond
+#: what the measurement required, so the choice was revisited against a number
+#: rather than against a memory of one.
+#:
+#: Measured over all 35 exported epochs, the minimum clean north bound is
+#: **53.083333 deg**.  53.0 therefore keeps the property the whole D-A decision
+#: exists to buy -- zero nodata inside the crop -- while discarding only
+#: 0.083333 deg / 20 rows / 20 178.6 km2 more than required.
+#:
+#: **54.0 was asked for and is not available.**  Nodata reaches down to
+#: 53.0875 N at ten of the forty-three baked epochs (17.5-19 and 20-26 ka), so a
+#: 54.0 bound would put the nodata question straight back into the product, which
+#: is the one thing D-A exists to remove.  The bound is set by the data, not by
+#: the request.
+#:
+#: What this does NOT do, stated because a reader will otherwise assume it: it
+#: does not retire the 51.0 tree.  ``khvalynian_basin_fields`` at 36-51 N is the
+#: frame every shipped Khvalynian product was measured on and it stays where it
+#: is; the 53.0 export lives beside it under its own root.
+CROP_NORTH_LAT_DEG = 53.0
 
 #: How far the requested bound may sit off the source raster's own cell grid
 #: before the crop is refused.  A crop that has to round is a crop that moves the
