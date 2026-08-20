@@ -272,12 +272,22 @@ def test_crop_record_states_how_much_more_the_choice_discards():
     assert record["measured_minimum_clean_north_lat_deg"] == pytest.approx(
         survey["minimum_clean_north_lat_deg"]
     )
-    # 220 clean rows would have sufficed; 720 are dropped, so 500 rows extra.
-    assert record["extra_rows_discarded"] == 500
-    assert record["extra_latitude_discarded_deg"] == pytest.approx(500 * 18.0 / 4320)
+    # The gap is DERIVED from the stub's own measurement and the chosen bound, not
+    # pinned: it was 500 rows at the 51.0 bound of 2026-08-05 and is 20 at the 53.0
+    # bound of 2026-08-18, and a test that spells the number out asserts the crop
+    # rather than the behaviour. What must hold at any bound is that the record
+    # states the gap, that it is consistent with the two latitudes it sits between,
+    # and that the kept and dropped rows add up to the source.
+    pixel = 18.0 / 4320
+    expected_extra = round((survey["minimum_clean_north_lat_deg"]
+                            - ebf.CROP_NORTH_LAT_DEG) / pixel)
+    assert record["extra_rows_discarded"] == expected_extra
+    assert record["extra_latitude_discarded_deg"] == pytest.approx(
+        expected_extra * pixel)
     assert record["extra_area_discarded_km2"] > 0
-    assert record["rows_dropped_of_source"] == 720
-    assert record["rows_kept_of_source"] == 3600
+    assert record["rows_dropped_of_source"] + record["rows_kept_of_source"] == 4320
+    assert record["rows_dropped_of_source"] == round(
+        (54.0 - ebf.CROP_NORTH_LAT_DEG) / pixel)
 
 
 def test_crop_record_reports_zero_extra_when_the_choice_is_the_measurement():
@@ -567,7 +577,11 @@ def test_the_crop_gap_is_on_every_raster(flooded):
     for product in ("basin_id", "water_level_m", "water_state_bits"):
         tags = _tags_for(flooded, product)
         assert float(tags["crop_extra_latitude_discarded_deg"]) > 0
-        assert int(tags["crop_extra_rows_discarded"]) == 500
+        # Derived, not pinned -- see the note in
+        # test_crop_record_states_how_much_more_the_choice_discards.
+        assert int(tags["crop_extra_rows_discarded"]) == round(
+            (float(tags["crop_measured_minimum_clean_north_lat_deg"])
+             - float(tags["crop_north_lat_deg"])) / (18.0 / 4320))
         assert tags["crop_north_decision"].startswith("OWNER DECISION D-A")
         assert tags["crop_measured_minimum_rule"]
 
