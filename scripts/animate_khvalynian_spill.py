@@ -6080,6 +6080,54 @@ def compose_caption(
     return "\n".join(parts)
 
 
+
+class PlanOnlyWouldOverwriteARenderedManifest(RuntimeError):
+    """``--plan-only`` was pointed at a build that already has rendered frames."""
+
+
+def _refuse_to_overwrite_a_rendered_manifest(manifest_path):
+    """Guard the manifest against a ``--plan-only`` run aimed at a real build.
+
+    ``--plan-only`` renders nothing and then writes the manifest anyway, so
+    aiming it at an existing build replaces the record of N rendered frames with
+    one whose every frame carries no picture. The PNGs survive; the file that
+    says what they are does not, and a sequence whose manifest says
+    ``png=False`` everywhere is indistinguishable from one that was never
+    rendered.
+
+    Refuses rather than warns: by the time a warning is read the file is gone.
+    Silent when there is no manifest, when it cannot be parsed, or when it
+    describes no rendered frame -- those are all cases where nothing is lost.
+    """
+    if not manifest_path.exists():
+        return
+    try:
+        prev = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return          # nothing legible to protect
+    rendered = [
+        f.get("epoch_ka")
+        for f in (prev.get("frames") or ())
+        if f.get("png") or (f.get("inset") or {}).get("png") or f.get("composed_png")
+    ]
+    if not rendered:
+        return
+    raise PlanOnlyWouldOverwriteARenderedManifest(
+        "REFUSING to write a plan-only manifest over %s, which describes %d "
+        "RENDERED frames (%s). --plan-only renders nothing, but it writes the "
+        "manifest, so this would replace the record of those frames with one "
+        "that says every frame has no picture -- and the pictures themselves "
+        "would still be sitting beside it. Point --out-root at a scratch "
+        "directory instead; this repo's own convention is a sibling named "
+        "_planonly_scratch_<tag> (see renders/_ABORTED_2026-08-04_*/"
+        "_planonly_scratch_rfinal). If you really mean to discard the record, "
+        "move or delete the manifest yourself first, deliberately."
+        % (manifest_path, len(rendered),
+           " ".join("%g" % float(e) for e in rendered[:12])
+           + (" ..." if len(rendered) > 12 else ""))
+    )
+
+
 def build_animation(
     *,
     out_root: Path | str = ANIM_ROOT,
@@ -6725,6 +6773,8 @@ def build_animation(
         panels=panels,
     )
     manifest_path = out_root / "sequence_manifest.json"
+    if plan_only:
+        _refuse_to_overwrite_a_rendered_manifest(manifest_path)
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     _log(f"manifest {manifest_path}", log_path)
     if corridor == "ramp":
