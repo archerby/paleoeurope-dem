@@ -263,3 +263,74 @@ def test_the_product_carries_what_it_is_not():
     src = (REPO / "scripts" / "drainage_implied.py").read_text(encoding="utf-8")
     assert "product_is_not" in src
     assert "No channel here was observed" in src
+
+
+# ---------------------------------------------------------------------------
+# reproducibility, and the setting that leaks out of the process
+# ---------------------------------------------------------------------------
+
+def test_the_default_is_the_only_reproducible_thread_count():
+    """MEASURED at 0 ka: three runs at WhiteboxTools' multi-core default gave
+    three DIFFERENT accumulation rasters and three different plateau exponents;
+    three runs at 1 gave byte-identical fill, pointer and accumulation. Every
+    artifact this repo ships carries a sha256, and a hash that changes run to run
+    verifies nothing."""
+    assert D.DETERMINISTIC_MAX_PROCS == 1
+
+
+def test_wbt_settings_are_restored_byte_for_byte(tmp_path, monkeypatch):
+    """set_max_procs does not configure the object -- it writes a settings.json
+    beside the installed package, shared by every user of the machine. A probe of
+    mine left this box at max_procs=1 and the probe's own next measurement then
+    believed it was reading the multi-core default."""
+    fake = tmp_path / "settings.json"
+    fake.write_text('{"max_procs": -1}\n', encoding="utf-8")
+    monkeypatch.setattr(D, "_wbt_settings_path", lambda: fake)
+
+    before = fake.read_bytes()
+    with D.wbt_settings_restored():
+        fake.write_text('{"max_procs": 1}\n', encoding="utf-8")
+        assert fake.read_bytes() != before
+    assert fake.read_bytes() == before
+
+
+def test_wbt_settings_are_restored_even_when_the_run_raises(tmp_path, monkeypatch):
+    """A refused epoch must not leave the machine reconfigured."""
+    fake = tmp_path / "settings.json"
+    fake.write_text('{"max_procs": -1}\n', encoding="utf-8")
+    monkeypatch.setattr(D, "_wbt_settings_path", lambda: fake)
+    before = fake.read_bytes()
+    with pytest.raises(D.DrainageRefusal):
+        with D.wbt_settings_restored():
+            fake.write_text('{"max_procs": 8}\n', encoding="utf-8")
+            raise D.DrainageRefusal("planted")
+    assert fake.read_bytes() == before
+
+
+def test_a_settings_file_that_did_not_exist_is_not_created(tmp_path, monkeypatch):
+    """Restoring must mean 'as it was', including 'absent'."""
+    fake = tmp_path / "settings.json"
+    monkeypatch.setattr(D, "_wbt_settings_path", lambda: fake)
+    with D.wbt_settings_restored():
+        fake.write_text("{}", encoding="utf-8")
+    assert not fake.exists()
+
+
+def test_the_thread_count_is_set_explicitly_on_every_run():
+    """Not setting it means inheriting whatever the last caller on this machine
+    left behind -- which is how a product's bytes come to depend on who ran
+    before you."""
+    src_ = (REPO / "scripts" / "drainage_implied.py").read_text(encoding="utf-8")
+    i_def = src_.index("def _wbt(work_dir")
+    body = src_[i_def:i_def + 1200]
+    assert "set_max_procs" in body
+    assert "max_procs=DETERMINISTIC_MAX_PROCS" in body
+
+
+def test_the_raster_declares_whether_it_is_reproducible():
+    """A reader holding one of these files must be able to tell whether its
+    sha256 predicts a rebuild, without the manifest open."""
+    src_ = (REPO / "scripts" / "drainage_implied.py").read_text(encoding="utf-8")
+    assert '"wbt_max_procs": max_procs' in src_
+    assert "byte-reproducible only at wbt_max_procs=1" in src_
+    assert "NOT byte-reproducible" in src_

@@ -59,6 +59,7 @@ threshold reaches it.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -113,6 +114,15 @@ PLATEAU_TOL = 0.01
 #: PLATEAU_TOL of the median" is true of every input there has ever been.
 PLATEAU_SPREAD_MAX = 0.02
 
+#: How many threads WhiteboxTools may use. ONE, by default, because WBT is not
+#: reproducible above it: measured at 0 ka, three runs at the multi-core default
+#: gave three different accumulation rasters and therefore three different
+#: products, while three runs at 1 gave byte-identical fill, pointer and
+#: accumulation. The cost is measured too -- about 51 s against 20 s per epoch --
+#: and it is the right trade here, because every artifact this repo ships carries
+#: a sha256 and a hash that changes run to run cannot verify anything.
+DETERMINISTIC_MAX_PROCS = 1
+
 #: The Manych corridor window the upper bound is measured in (w, s, e, n).
 #: The rivers probe's own diagnostic window, kept identical because the upper
 #: bound is READ OUT of it -- a different rectangle makes the bound a statement
@@ -165,11 +175,50 @@ def topo_dir(explicit=None):
 # the step
 # ---------------------------------------------------------------------------
 
-def _wbt(work_dir):
+def _wbt_settings_path():
+    """Where WhiteboxTools persists ``max_procs`` -- beside the installed
+    package, NOT inside the object."""
+    import whitebox
+    return Path(whitebox.WhiteboxTools().exe_path) / "settings.json"
+
+
+@contextlib.contextmanager
+def wbt_settings_restored():
+    """Put back whatever ``settings.json`` held before this run touched it.
+
+    ``set_max_procs`` writes to a file shared by every WhiteboxTools user on the
+    machine, so without this a run would silently re-configure everyone else's.
+    It already happened once: a probe left this box at max_procs=1, and the same
+    probe's next measurement then believed it was reading the multi-core default.
+    """
+    p = _wbt_settings_path()
+    before = p.read_bytes() if p.exists() else None
+    try:
+        yield
+    finally:
+        try:
+            if before is None:
+                if p.exists():
+                    p.unlink()
+            else:
+                p.write_bytes(before)
+        except OSError:
+            pass
+
+
+def _wbt(work_dir, max_procs=DETERMINISTIC_MAX_PROCS):
+    """A WhiteboxTools handle with the thread count set EXPLICITLY.
+
+    Explicitly, every time, because the setting is persisted globally: a run that
+    does not set it inherits whatever the last caller on this machine left, which
+    is how a product's bytes come to depend on who ran before you.
+    """
     import whitebox
     w = whitebox.WhiteboxTools()
     w.work_dir = str(work_dir)
     w.set_verbose_mode(False)
+    if max_procs is not None:
+        w.set_max_procs(int(max_procs))
     return w
 
 
@@ -262,7 +311,7 @@ def choose_threshold(rows, requested=None):
 
 
 def build_epoch(epoch, fields, topo, out_dir, work_dir, keep_intermediate=False,
-                requested_threshold=None):
+                requested_threshold=None, max_procs=DETERMINISTIC_MAX_PROCS):
     ep = "%g" % float(epoch)
     ws_p = fields / "water_state" / ("water_state_%ska.tif" % ep)
     topo_p = topo / ("khv_%ska.tif" % ep)
@@ -323,7 +372,7 @@ def build_epoch(epoch, fields, topo, out_dir, work_dir, keep_intermediate=False,
         "cells_land": int((masked != NODATA).sum()),
     }, predictor=None)
 
-    wbt = _wbt(work_dir)
+    wbt = _wbt(work_dir, max_procs=max_procs)
     fill = work_dir / ("land_fill_%s.tif" % ep)
     pntr = work_dir / ("land_pntr_%s.tif" % ep)
     acc_p = work_dir / ("land_acc_%s.tif" % ep)
@@ -397,6 +446,20 @@ def build_epoch(epoch, fields, topo, out_dir, work_dir, keep_intermediate=False,
         "input_dem": str(topo_p), "input_dem_sha256": sha256_file(str(topo_p)),
         "input_water_state_sha256": sha256_file(str(ws_p)),
         "wbt_version": "WhiteboxTools v2.4.0",
+        "wbt_max_procs": max_procs,
+        "reproducibility": (
+            "byte-reproducible only at wbt_max_procs=1. MEASURED at 0 ka: three "
+            "runs at WhiteboxTools' multi-core default produced three DIFFERENT "
+            "accumulation rasters and therefore three different products, while "
+            "three runs at 1 produced byte-identical fill, pointer and "
+            "accumulation. Above one thread the D8 tie-breaking after "
+            "FillDepressions depends on thread scheduling, and this raster's own "
+            "sha256 then verifies nothing"
+            if max_procs == 1 else
+            "NOT byte-reproducible: this raster was built with "
+            "wbt_max_procs != 1, and WhiteboxTools is measurably "
+            "non-deterministic above one thread. Its sha256 identifies THIS "
+            "file and does not predict a rebuild"),
         "channel_cells": int(sm.sum()),
         "channel_length_km": length,
         "network_fragments_8connected": int(frag),
@@ -476,6 +539,11 @@ def main(argv=None):
     ap.add_argument("--topo-dir", default=None)
     ap.add_argument("--work-dir", default=None)
     ap.add_argument("--keep-intermediate", action="store_true")
+    ap.add_argument("--max-procs", type=int, default=DETERMINISTIC_MAX_PROCS,
+                    help="threads WhiteboxTools may use. 1 (the default) is the "
+                         "only value at which the product is byte-reproducible; "
+                         "it costs about 2.5x the wall time. Anything else is "
+                         "recorded in every raster as NOT reproducible.")
     ap.add_argument("--threshold-cells", type=float, default=None,
                     help="use THIS threshold at every epoch instead of choosing "
                          "one per epoch from its own sweep. The comparable "
@@ -493,21 +561,23 @@ def main(argv=None):
     print("out     %s" % out_dir, flush=True)
 
     records, refused = [], {}
-    for ep in a.epochs:
-        try:
-            rec = build_epoch(ep, fields, topo, out_dir, work,
-                              keep_intermediate=a.keep_intermediate,
-                              requested_threshold=a.threshold_cells)
-        except (DrainageRefusal, GuardFailure) as exc:
-            refused["%g" % float(ep)] = str(exc)
-            print("[D] %s ka REFUSED: %s" % (ep, exc), flush=True)
-            continue
-        records.append(rec)
-        print("[D] %-6s ka  T=%-8.0f cells  %d channel cells  %.1f km  "
-              "density %.6f km/km2  %d fragments"
-              % (rec["epoch_ka"], rec["threshold_cells"], rec["channel_cells"],
-                 rec["channel_length_km"], rec["drainage_density_km_per_km2"],
-                 rec["network_fragments_8connected"]), flush=True)
+    with wbt_settings_restored():
+      for ep in a.epochs:
+          try:
+              rec = build_epoch(ep, fields, topo, out_dir, work,
+                                keep_intermediate=a.keep_intermediate,
+                                requested_threshold=a.threshold_cells,
+                                max_procs=a.max_procs)
+          except (DrainageRefusal, GuardFailure) as exc:
+              refused["%g" % float(ep)] = str(exc)
+              print("[D] %s ka REFUSED: %s" % (ep, exc), flush=True)
+              continue
+          records.append(rec)
+          print("[D] %-6s ka  T=%-8.0f cells  %d channel cells  %.1f km  "
+                "density %.6f km/km2  %d fragments"
+                % (rec["epoch_ka"], rec["threshold_cells"], rec["channel_cells"],
+                   rec["channel_length_km"], rec["drainage_density_km_per_km2"],
+                   rec["network_fragments_8connected"]), flush=True)
 
     manifest = {
         "product": "drainage_implied",
@@ -518,6 +588,12 @@ def main(argv=None):
         "sweep_thresholds_cells": list(SWEEP_CELLS),
         "plateau_tolerance": PLATEAU_TOL,
         "plateau_spread_max": PLATEAU_SPREAD_MAX,
+        "wbt_max_procs": None,
+        "wbt_settings_are_global": (
+            "WhiteboxTools persists max_procs into a settings.json beside the "
+            "installed package, shared by every user on the machine. This run "
+            "set it explicitly and restored the previous contents afterwards, so "
+            "it neither inherited nor left behind a thread count"),
         "requested_threshold_cells": None,
         "manych_box_wsen": list(MANYCH_BOX),
         "epochs_built": [r["epoch_ka"] for r in records],
@@ -525,6 +601,8 @@ def main(argv=None):
         "common_threshold": common_threshold(records),
         "epochs": records,
     }
+    manifest["wbt_max_procs"] = a.max_procs
+    manifest["reproducible"] = (a.max_procs == 1)
     manifest["requested_threshold_cells"] = a.threshold_cells
     manifest["threshold_mode"] = (
         "per-epoch: each raster carries a threshold chosen from its OWN sweep, "
