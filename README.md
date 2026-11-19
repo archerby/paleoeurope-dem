@@ -13,7 +13,13 @@
 
 This pipeline fuses [FABDEM v1.2](https://doi.org/10.5523/bris.25wfy0f9ukibjp75gb8laq1ghq) (bare-earth land DEM) with [GEBCO 2024](https://doi.org/10.5285/1c44ce99-0a0d-5f4f-e063-7086abc0ea0f) (bathymetry) across a continuous land–sea boundary, optionally evaluates/applies an EGM2008-based geoid/undulation offset as a vertical-alignment step (validation-dependent), and then applies glacial isostatic adjustment (GIA) corrections from ICE-6G_C and ICE-7G_NA models to reconstruct topography at epochs **0 ka, 8 ka, 12 ka, and 21 ka**.
 
-**Paper:** [https://doi.org/10.31223/X59T9W](https://doi.org/10.31223/X59T9W)
+> **Status (2026-11-19): v1.1 in progress.** The GIA method described in the v1.0
+> preprint (`Orog(t) − Orog(0)`) and the sea-level values used there are superseded;
+> the engine now applies a present-datum displacement from ICE-6G_C `Topo` and the
+> published Spratt & Lisiecki (2016) curve. See [CHANGELOG.md](CHANGELOG.md) before
+> using v1.0 numbers.
+
+**Paper (v1.0 preprint, superseded method):** [https://doi.org/10.31223/X59T9W](https://doi.org/10.31223/X59T9W)
 **Data (Zenodo):** [10.5281/zenodo.18804506](https://doi.org/10.5281/zenodo.18804506)  
 **API Docs:** [archerby.github.io/paleoeurope-dem](https://archerby.github.io/paleoeurope-dem)
 

@@ -2830,9 +2830,9 @@ class TestTheForeignSpellingSkipIsKeyedOnTheArtifactNotThePlatform:
     def test_a_windows_spelling_is_skipped_on_posix(self):
         for planted in (r"Y:\paleo\renders\x\frame_00_17ka.png",
                         r"C:/tmp/frame.png",
-                        r"\\192.168.88.250\Storage\paleo\renders\x\frame.png",
+                        r"\\nas\Storage\paleo\renders\x\frame.png",
                         {"as_written": r"Y:\paleo\renders\x\anim.gif",
-                         "resolved": r"\\192.168.88.250\Storage\paleo\x\anim.gif"}):
+                         "resolved": r"\\nas\Storage\paleo\x\anim.gif"}):
             # pytest's Skipped derives from BaseException, NOT Exception -- the
             # first version of this test used pytest.raises(Exception), so the
             # skip escaped the context manager and turned THIS test into a skip.

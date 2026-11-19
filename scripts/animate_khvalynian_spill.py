@@ -461,7 +461,7 @@ from paleoeurope.viz.paleocostline_render import (  # noqa: E402
 #:
 #: ``Path.resolve()`` on Windows expands a mapped network drive to the UNC share it
 #: points at, so ``Y:\paleo\renders\...`` comes back
-#: ``\\192.168.88.250\Storage\paleo\renders\...``.  The 2026-08-03 manifests
+#: ``\\nas\Storage\paleo\renders\...``.  The 2026-08-03 manifests
 #: therefore mixed the two: ``raster.path_as_read`` was drive-lettered (it is the
 #: string the run was handed), while ``seeds[].raster_path``, ``canvas_frame``,
 #: ``palette.master.built_over`` and ``level_curves[].path`` were UNC (they went
@@ -481,7 +481,7 @@ from paleoeurope.viz.paleocostline_render import (  # noqa: E402
 #: single-spelling value elsewhere in the file can be converted either way.
 PATH_SPELLING_DECISION = (
     "Path.resolve() on Windows expands a mapped drive to its UNC target, so "
-    "Y:\\paleo\\... and \\\\192.168.88.250\\Storage\\paleo\\... are the SAME file. "
+    "Y:\\paleo\\... and \\\\nas\\Storage\\paleo\\... are the SAME file. "
     "That is not a defect and neither spelling is privileged: the UNC form names "
     "the real location and survives being read on a machine with no Y: mapping; "
     "the drive letter is the per-machine mapping this project writes down "

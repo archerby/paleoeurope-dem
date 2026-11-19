@@ -4,6 +4,11 @@ It is a stub that FAILS ON PURPOSE.  Do not delete it and do not skip it: an emp
 or absent ``tests/test_viz.py`` makes the suite report green with zero renderer
 tests collected, which is a worse lie than a red one.
 
+NOTE (2026-11-19): the recovery directory ``_RECOVERY_test_viz_2026-08-04/`` was
+removed from the published tree. It is intact in git history; read it with
+``git show 78b4b5e:_RECOVERY_test_viz_2026-08-04/README.md`` (and the sibling
+files at the same commit).
+
 WHAT HAPPENED
 -------------
 The C-EDGE agent was rewriting this file with a whole-file write while ``D:`` had

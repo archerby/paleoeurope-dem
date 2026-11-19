@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Work towards v1.1 (not yet released). Corrections to the method described in the
+v1.0 preprint (https://doi.org/10.31223/X59T9W):
+
+### Fixed
+
+- **GIA delta.** v1.0 used `Orog(t) − Orog(0)`. ICE-6G_C `Orog` is clamped to 0 over
+  water and referred to the contemporaneous sea surface, so the correction vanished
+  under the palaeo-shoreline and carried the eustatic term over land. The engine now
+  uses the present-datum displacement `Δz_solid = [Topo(t) − Topo(0)] − offset(t)`
+  (`paleoeurope/gia/ice6g_topo.py`), with `offset(t)` referenced to far-field,
+  never-glaciated tropical land; the land/sea threshold is `−offset(t)`. The loader
+  refuses the `Orog` path.
+- **Sea-level curve.** The file used as "Spratt & Lisiecki 2016" was a hand-drawn
+  sketch. The engine now reads the published shortPC1 series (pinned by tests) and
+  interpolates half-step epochs linearly instead of snapping to a neighbour.
+- Closed basins (Black Sea, Caspian) get their own levels, converted between frames
+  (`pontic_threshold`), instead of the global eustatic value.
+
+### Known limitations
+
+- Cells covered by ice at either endpoint have no bedrock estimate (NaN): the
+  10-arcmin ICE-6G_C files carry no ice thickness.
+- `tests/test_viz.py` is a stub that fails on purpose (see its docstring).
+- Two legacy figure scripts, `scripts/render_black_sea_corrected.py` and
+  `scripts/render_black_sea_hero.py`, still read the sketch curve
+  (`spratt_lisiecki_2016_simplified.csv`). Do not use them for science.
+
 ## [0.1.0-alpha] — 2026-02-21
 
 ### Added
